@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from kdv.analysis.model import AnalysisModel, ModelStore
+from kdv.analysis.projects import ProjectStore
 from kdv.analysis.runner import RunResult
 from kdv.config.models import LLMPreset
 from kdv.config.presets import PresetStore, SettingsStore
@@ -17,6 +18,7 @@ class AppState:
     models: ModelStore = field(default_factory=ModelStore)
     settings: SettingsStore = field(default_factory=SettingsStore)
     secrets: SecretStore = field(default_factory=SecretStore)
+    projects: ProjectStore = field(default_factory=ProjectStore)
     last_run: RunResult | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 

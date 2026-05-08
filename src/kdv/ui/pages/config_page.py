@@ -187,16 +187,71 @@ class ConfigPage(QWidget):
         ):
             w.setMinimumHeight(34)
 
+        def _hint(text: str) -> QWidget:
+            from PySide6.QtWidgets import QLabel as _QL
+
+            lbl = _QL(text)
+            lbl.setStyleSheet("color:#9CA3AF; font-size:11px; padding:0 0 4px 2px;")
+            lbl.setWordWrap(True)
+            return lbl
+
         form.addRow("名称", self.name_input)
+        form.addRow("", _hint("给配置起个易识别的名字，例如『DeepSeek 主账号』『智谱 GLM 测试』。"))
+
         form.addRow("Base URL", self.base_url_input)
+        form.addRow("", _hint(
+            "OpenAI 兼容服务的 API 端点，到 /v1 为止：\n"
+            "  · OpenAI       https://api.openai.com/v1\n"
+            "  · DeepSeek     https://api.deepseek.com/v1\n"
+            "  · 智谱 GLM     https://open.bigmodel.cn/api/paas/v4\n"
+            "  · Moonshot     https://api.moonshot.cn/v1\n"
+            "  · 火山方舟     https://ark.cn-beijing.volces.com/api/v3\n"
+            "  · Azure OpenAI https://<your>.openai.azure.com/openai/deployments/<id>"
+        ))
+
         form.addRow("API Key", key_wrap)
+        form.addRow("", _hint("以 sk- 或服务商指定前缀开头。会加密保存到系统钥匙串。"))
+
         form.addRow("模型 ID", self.model_input)
+        form.addRow("", _hint(
+            "服务商接受的模型标识符。常见：gpt-4o-mini / gpt-4o / "
+            "deepseek-chat / glm-4 / moonshot-v1-128k / claude-3-5-sonnet-20241022。"
+        ))
+
         form.addRow("温度", self.temp_input)
+        form.addRow("", _hint(
+            "0–2 之间。结构化数据分析建议 0.0–0.3（更确定、可重现）；"
+            "需要发散洞察可设 0.5–0.8。"
+        ))
+
         form.addRow("最大 tokens", self.maxtok_input)
+        form.addRow("", _hint(
+            "单次回复输出上限。建议：逐行 1024–2048；字段多 2048–4096；"
+            "整表汇总 4096–8192；大型多维报告 8192–16384。设大不浪费——按真实输出计费。"
+        ))
+
         form.addRow("超时", self.timeout_input)
+        form.addRow("", _hint(
+            "单次 HTTP 请求的等待秒数。简短问答 30；常规分析 60；超长 prompt（>8k tokens）建议 120–180。"
+        ))
+
         form.addRow("并发", self.concurrency_input)
+        form.addRow("", _hint(
+            "逐行模式同时发出的请求数。免费/低速率服务 2–3；DeepSeek/OpenAI 标准 5–10；"
+            "企业级 / 高速率配额 10–20。设太大会触发 429 限流。"
+        ))
+
         form.addRow("最大重试", self.retries_input)
+        form.addRow("", _hint(
+            "遇到 429 / 5xx / 网络异常时自动指数退避重试的次数。常规 3 即可；网络不稳定可设 5。"
+        ))
+
         form.addRow("结构化模式", self.struct_mode)
+        form.addRow("", _hint(
+            "  · auto（推荐）：优先用 function calling 强约束输出，失败则回退到提示词\n"
+            "  · function_calling：强制走工具调用，部分国产代理可能不支持\n"
+            "  · prompt：完全靠提示词要求 JSON 输出，兼容性最好但偶尔失败"
+        ))
 
         self._detail_holder_lay.addLayout(form)
 

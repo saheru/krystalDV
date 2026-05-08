@@ -19,6 +19,7 @@ from kdv.ui import helpers as h
 from kdv.ui import style
 from kdv.ui.pages.config_page import ConfigPage
 from kdv.ui.pages.model_page import ModelPage
+from kdv.ui.pages.projects_page import ProjectsPage
 from kdv.ui.pages.result_page import ResultPage
 from kdv.ui.pages.run_page import RunPage
 from kdv.ui.state import AppState
@@ -29,6 +30,7 @@ NAV_ITEMS = [
     ("model", "🧬  分析模型"),
     ("run", "▶  运行分析"),
     ("result", "📊  结果可视化"),
+    ("projects", "📁  项目历史"),
 ]
 
 
@@ -128,11 +130,13 @@ class MainWindow(QMainWindow):
         self.model_page = ModelPage(self.state)
         self.run_page = RunPage(self.state)
         self.result_page = ResultPage(self.state)
+        self.projects_page = ProjectsPage(self.state)
         self._page_index = {
             "config": self.stack.addWidget(self.config_page),
             "model": self.stack.addWidget(self.model_page),
             "run": self.stack.addWidget(self.run_page),
             "result": self.stack.addWidget(self.result_page),
+            "projects": self.stack.addWidget(self.projects_page),
         }
 
         body.addWidget(self.stack, 1)
@@ -145,6 +149,8 @@ class MainWindow(QMainWindow):
         self.config_page.presets_changed.connect(self.run_page.refresh_pickers)
         self.model_page.models_changed.connect(self.run_page.refresh_pickers)
         self.run_page.run_completed.connect(self._on_run_completed)
+        self.run_page.run_completed.connect(lambda _r: self.projects_page.refresh())
+        self.projects_page.project_opened.connect(self._on_run_completed)
 
     def _setup_shortcuts(self) -> None:
         for i, (key, _) in enumerate(NAV_ITEMS, start=1):

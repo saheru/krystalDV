@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from kdv.analysis.projects import ProjectSnapshot
 from kdv.analysis.runner import AnalysisRunner, RunProgress
 from kdv.excel.reader import ExcelTable, read_excel
 from kdv.excel.writer import write_results
@@ -398,6 +399,36 @@ class RunPage(QWidget):
             f"/ {result.duration_ms_total} ms / tokens {result.prompt_tokens_total}+{result.completion_tokens_total}"
         )
         self.state.last_run = result
+        # Auto-save as a project
+        try:
+            src_path = self._data.source_path if self._data else ""
+            project_name = (
+                f"{Path(src_path).stem if src_path else '分析'}"
+                f" · {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            )
+            snap = ProjectSnapshot(
+                name=project_name,
+                preset_id=preset.id,
+                preset_name=preset.name,
+                model_id=preset.model,
+                analysis_model_id=(model.id if model else ""),
+                analysis_model_name=(model.name if model else "（无模型）"),
+                mode=mode,
+                source_path=src_path,
+                columns=list(result.columns),
+                rows=list(result.rows),
+                row_outputs=list(result.row_outputs),
+                row_errors=list(result.row_errors),
+                summary_markdown=result.summary_markdown,
+                prompt_tokens_total=result.prompt_tokens_total,
+                completion_tokens_total=result.completion_tokens_total,
+                duration_ms_total=result.duration_ms_total,
+            )
+            self.state.projects.save(snap)
+            self._append_log(f"已保存为项目：{project_name}")
+        except Exception as e:  # noqa: BLE001
+            self._append_log(f"保存项目失败：{e}")
+
         self.run_completed.emit(result)
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
