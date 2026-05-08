@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from kdv.agent.manager import AgentJob
+from kdv.agent.manager import AgentJob, parse_tasks
 from kdv.agent.trace import TraceEvent
 from kdv.excel.reader import ExcelTable, read_excel
 from kdv.ui import helpers as h
@@ -371,6 +371,19 @@ class NewAgentJobDialog(QDialog):
                 self.preset_picker.setCurrentIndex(i)
         self.preset_picker.currentIndexChanged.connect(self._refresh_fc_warning)
 
+        # Optional FAST preset for tool-call loop / compaction.
+        self.fast_picker = QComboBox()
+        self.fast_picker.setMinimumHeight(36)
+        self.fast_picker.addItem("（与主模型相同）", "")
+        for p in self.state.presets.list():
+            self.fast_picker.addItem(f"{p.name} · {p.model}", p.id)
+        # Default-select state.settings.fast_preset_id if present
+        default_fast = self.state.settings.settings.fast_preset_id
+        if default_fast:
+            i = self.fast_picker.findData(default_fast)
+            if i >= 0:
+                self.fast_picker.setCurrentIndex(i)
+
         # Data upload row
         data_row = QHBoxLayout()
         self.upload_btn = h.primary_button("📂 上传数据 Excel")
@@ -392,10 +405,22 @@ class NewAgentJobDialog(QDialog):
         self.tasks_input.setMinimumHeight(180)
 
         form.addRow("任务名称", self.name_input)
-        form.addRow("LLM 配置", self.preset_picker)
+        form.addRow("主 LLM 配置", self.preset_picker)
+        form.addRow("快速模型", self.fast_picker)
         form.addRow("数据 Excel", data_wrap)
         form.addRow("任务列表", self.tasks_input)
         lay.addLayout(form)
+
+        # Hint under the fast picker
+        fast_hint = QLabel(
+            "💡 工具调用 + 上下文压缩用快速模型（Haiku / DeepSeek / Flash），"
+            "最终任务总结用主模型。可显著提速 5-10×。"
+        )
+        fast_hint.setStyleSheet(
+            "color: #6B7280; font-size: 11px; padding: 0 4px;"
+        )
+        fast_hint.setWordWrap(True)
+        lay.addWidget(fast_hint)
 
         # FC-support warning banner — shown only when the chosen preset
         # is known not to support OpenAI function calling.
@@ -479,7 +504,7 @@ class NewAgentJobDialog(QDialog):
         if not self._data or not self._data.rows:
             h.toast(self.parent() or self, "请上传数据 Excel", "warning")
             return None
-        tasks = [t.strip() for t in self.tasks_input.toPlainText().splitlines() if t.strip()]
+        tasks = parse_tasks(self.tasks_input.toPlainText())
         if not tasks:
             h.toast(self.parent() or self, "请至少写一个任务", "warning")
             return None
@@ -487,6 +512,10 @@ class NewAgentJobDialog(QDialog):
             f"{Path(self._data.source_path).stem} · "
             f"{datetime.now().strftime('%H:%M:%S')}"
         )
+        # Optional fast preset for the tool-call loop
+        fast_pid = self.fast_picker.currentData()
+        fast_preset = self.state.presets.get(fast_pid) if fast_pid else None
+        fast_api_key = self.state.get_api_key(fast_preset) if fast_preset else ""
         return {
             "name": name,
             "tasks": tasks,
@@ -494,4 +523,6 @@ class NewAgentJobDialog(QDialog):
             "api_key": api_key,
             "columns": list(self._data.columns),
             "rows": list(self._data.rows),
+            "fast_preset": fast_preset,
+            "fast_api_key": fast_api_key,
         }

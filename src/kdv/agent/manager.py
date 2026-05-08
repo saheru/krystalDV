@@ -1,5 +1,12 @@
 """In-memory manager for concurrently-running Agent jobs.
 
+Includes `parse_tasks(text)` which intelligently splits a user paste into
+discrete agent tasks — handling common formats like:
+  - One task per line
+  - Multi-line tasks separated by blank lines
+  - Explicit "# 任务 1 / # 任务 2" section markers (Markdown comments stay
+    out of the task body).
+
 Each `AgentJob` is a Qt QObject that emits signals as the agent runs:
 - `event`: per-step trace event (thoughts, tool calls, results, ...)
 - `state_changed`: status transitions (running → done / cancelled / error)
@@ -12,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -49,6 +57,8 @@ class AgentJob(QObject):
         rows: list[dict[str, Any]],
         registry: ToolRegistry | None = None,
         max_steps_per_task: int = 16,
+        fast_preset: LLMPreset | None = None,
+        fast_api_key: str = "",
     ) -> None:
         super().__init__()
         self.id: str = uuid.uuid4().hex[:12]
@@ -56,6 +66,8 @@ class AgentJob(QObject):
         self.tasks: list[str] = list(tasks)
         self.preset = preset
         self.api_key = api_key
+        self.fast_preset = fast_preset
+        self.fast_api_key = fast_api_key
         self.columns = list(columns)
         self.rows = list(rows)
         self.registry = registry or build_default_registry()
@@ -89,6 +101,8 @@ class AgentJob(QObject):
             api_key=self.api_key,
             registry=self.registry,
             max_steps_per_task=self.max_steps_per_task,
+            fast_preset=self.fast_preset,
+            fast_api_key=self.fast_api_key,
         )
         try:
             def _on_event(e: TraceEvent) -> None:
@@ -161,6 +175,8 @@ class AgentManager(QObject):
         api_key: str,
         columns: list[str],
         rows: list[dict[str, Any]],
+        fast_preset: LLMPreset | None = None,
+        fast_api_key: str = "",
     ) -> AgentJob:
         job = AgentJob(
             name=name,
@@ -169,9 +185,79 @@ class AgentManager(QObject):
             api_key=api_key,
             columns=columns,
             rows=rows,
+            fast_preset=fast_preset,
+            fast_api_key=fast_api_key,
         )
         self._jobs.append(job)
         self.job_added.emit(job)
         # Schedule the async run on the qasync-bridged event loop.
         asyncio.ensure_future(job.run())
         return job
+
+
+# ======================================================================
+# Task-list parser: split a user paste into a list of agent tasks.
+# ======================================================================
+
+# Matches lines like "# 任务 1", "## 任务1", "任务一：", "Task 1", "1." (numbered),
+# anywhere on the line. Used as a section delimiter.
+_TASK_DELIM_RE = re.compile(
+    r"^\s*(?:#+\s*)?(?:任务|Task)\s*[一二三四五六七八九十\d]+\s*[:：.、]?\s*$",
+    re.MULTILINE,
+)
+
+
+def parse_tasks(text: str) -> list[str]:
+    """Split a free-form paste into discrete agent tasks.
+
+    Resolution order:
+      1. If '# 任务 N' / 'Task N' delimiters are present → split on them.
+         Every non-empty body in between becomes one task.
+      2. Else if blank-line-separated paragraphs exist → each paragraph
+         (excluding lines starting with `#`, treated as Markdown headings)
+         becomes one task.
+      3. Else fall back to "one non-empty non-comment line = one task".
+    """
+    if not text or not text.strip():
+        return []
+
+    # ---- 1. explicit section delimiters ---------------------------
+    first_match = _TASK_DELIM_RE.search(text)
+    if first_match is not None:
+        # Drop the preamble before the first delimiter — it's intro/help
+        # text, not a task. (Common case: "## 单月对账(快速版)\n... # 任务 1 …".)
+        post = text[first_match.start():]
+        parts = _TASK_DELIM_RE.split(post)
+        cleaned: list[str] = []
+        for part in parts:
+            body = _strip_markdown_headings(part).strip()
+            if body:
+                cleaned.append(body)
+        if cleaned:
+            return cleaned
+
+    # ---- 2. blank-line-separated paragraphs -----------------------
+    paragraphs = [p for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if len(paragraphs) > 1:
+        out: list[str] = []
+        for p in paragraphs:
+            body = _strip_markdown_headings(p).strip()
+            if body:
+                out.append(body)
+        if out:
+            return out
+
+    # ---- 3. line-by-line (skip Markdown comments / blank) --------
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def _strip_markdown_headings(block: str) -> str:
+    """Drop lines that are pure Markdown headings (`# foo`, `## bar`)."""
+    return "\n".join(
+        ln for ln in block.splitlines()
+        if not re.match(r"^\s*#+\s+", ln)
+    )

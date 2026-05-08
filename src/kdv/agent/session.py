@@ -65,11 +65,16 @@ class AgentSession:
     rows: list[dict[str, Any]]
     registry: ToolRegistry = field(default_factory=build_default_registry)
     max_steps_per_turn: int = 10
+    fast_preset: LLMPreset | None = None
+    fast_api_key: str = ""
 
     _ctx: ConversationContext | None = None
     _tool_ctx: ToolContext | None = None
 
     def __post_init__(self) -> None:
+        if self.fast_preset is None:
+            self.fast_preset = self.preset
+            self.fast_api_key = self.api_key
         stats = summarize_columns(self.columns, self.rows)
         self._tool_ctx = ToolContext(columns=self.columns, rows=self.rows, stats=stats)
         self._ctx = ConversationContext(
@@ -122,9 +127,11 @@ class AgentSession:
         summary = ""
         abort_reason = ""
 
-        async with LLMClient(self.preset, self.api_key) as client:
+        async with LLMClient(self.preset, self.api_key) as client, \
+                   LLMClient(self.fast_preset, self.fast_api_key) as fast_client:
+
             async def _summarize_async(text: str) -> str:
-                resp = await client.chat(
+                resp = await fast_client.chat(
                     system_prompt="Summarize agent history concisely.",
                     user_prompt=text,
                     schema_fields=None,
@@ -147,9 +154,11 @@ class AgentSession:
                         logger.exception("compaction failed")
 
                 try:
-                    resp = await client.chat_with_tools(
+                    # Tool-call decisions go through the FAST client.
+                    resp = await fast_client.chat_with_tools(
                         messages=self._ctx.to_openai(),
                         tools=self.registry.to_openai_specs(),
+                        max_tokens=min(self.fast_preset.max_tokens, 1024),
                     )
                 except LLMError as e:
                     abort_reason = f"llm_error: {e}"

@@ -58,5 +58,8 @@ class AppSettings(BaseModel):
     sidebar_collapsed: bool = False
     last_preset_id: str = ""
     last_model_id: str = ""
+    # Default "fast" preset for agent tool-call loops + per-row analysis.
+    # Empty means: fall back to the main preset.
+    fast_preset_id: str = ""
     window_width: int = 1280
     window_height: int = 800

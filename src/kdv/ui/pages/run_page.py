@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from kdv.agent.manager import parse_tasks
 from kdv.agent.runner import AgentRunner, AgentResult
 from kdv.agent.trace import TraceEvent
 from kdv.analysis.projects import ProjectSnapshot
@@ -431,11 +432,7 @@ class RunPage(QWidget):
             if not api_key:
                 h.toast(self.window(), "API key 为空，请到配置页填写并保存", "danger")
                 return
-            tasks = [
-                t.strip()
-                for t in self.extra_goal.toPlainText().splitlines()
-                if t.strip()
-            ]
+            tasks = parse_tasks(self.extra_goal.toPlainText())
             if not tasks:
                 h.toast(
                     self.window(),

@@ -39,21 +39,34 @@ SYSTEM_PROMPT_TEMPLATE = """\
 - 行数：{n_rows}
 - 列名：{column_list}
 
-【你的工作流程（必须遵守）】
+【你的工作流程】
 1. 收到任务后，先用 `list_columns` 获取 schema 全貌（如果尚未获取）。
 2. 用 `sample_rows` 看几行真实数据，建立直觉。
 3. 通过组合 `describe_column` / `aggregate` / `filter_rows` / `correlate` /
    `distinct_values` / `text_search` 收集证据。
-4. 把发现保存为图表（`add_chart`）和洞察（`record_insight`），让结果页可视化。
+4. 把发现保存为图表（`add_chart`）和洞察（`record_insight`）。
 5. 任务完成时调用 `finish_task`，给出 Markdown 总结。
 
-【准则】
-- 一次只调用一个工具；不要凭空臆造数据，所有结论必须来自工具返回值。
+【效率准则（重要）】
+- **优先一次性发起多个独立工具调用**：如果你已经知道下一步要查 A、B、C
+  三件事且互相不依赖，请在同一个回复里同时调用三个 tool（OpenAI 协议
+  支持单回合多 tool_calls），而不是逐个串行。这能把整个任务的耗时从
+  N×LLM 思考时间压缩到 1×LLM 思考时间，**显著提速**。
+- 反例：先 aggregate 再 filter 再 correlate 串行三步。
+- 正例：同一回合返回 [aggregate(...), filter_rows(...), correlate(...)]。
+
+【其他准则】
+- 不要凭空臆造数据，所有结论必须来自工具返回值。
 - 工具返回越简短越好——你之后还会处理多个任务，注意 token 预算。
 - 当用户给的任务比较模糊时，自行拆解为可验证的子问题。
 - 优先调用 `add_chart` 和 `record_insight` 把发现固化下来；最终的 finish_task
   summary 仅是收尾。
 """
+
+
+# Tool-call turns are short — the model just emits a tool_calls JSON.
+# Capping max_tokens here saves both latency and cost.
+AGENT_TOOL_TURN_MAX_TOKENS = 1024
 
 
 @dataclass
@@ -91,9 +104,17 @@ class AgentRunner:
         api_key: str,
         registry: ToolRegistry | None = None,
         max_steps_per_task: int = 16,
+        fast_preset: LLMPreset | None = None,
+        fast_api_key: str = "",
     ) -> None:
+        """`fast_preset` is used for tool-call decision turns and context
+        compaction (the high-volume cheap turns). `preset` is used for the
+        final task summary. If `fast_preset` is None, falls back to `preset`.
+        """
         self.preset = preset
         self.api_key = api_key
+        self.fast_preset = fast_preset or preset
+        self.fast_api_key = fast_api_key or api_key
         self.registry = registry or build_default_registry()
         self.max_steps_per_task = max_steps_per_task
 
@@ -138,9 +159,15 @@ class AgentRunner:
         completion_tokens = 0
         task_summaries: list[dict[str, str]] = []
 
-        async with LLMClient(self.preset, self.api_key) as client:
+        # Two clients: `fast_client` does the tool-call loop (high frequency,
+        # short responses → cheap+fast); `client` writes the final summary
+        # when the agent finishes a task.
+        async with LLMClient(self.preset, self.api_key) as client, \
+                   LLMClient(self.fast_preset, self.fast_api_key) as fast_client:
+
             async def _summarize(text: str) -> str:
-                resp = await client.chat(
+                # Compaction summaries also use the fast client.
+                resp = await fast_client.chat(
                     system_prompt="You summarize agent conversation history concisely in Chinese.",
                     user_prompt=text,
                     schema_fields=None,
@@ -165,6 +192,7 @@ class AgentRunner:
 
                 steps_used, pt, ct, summary, abort_reason = await self._run_one_task(
                     client=client,
+                    fast_client=fast_client,
                     ctx=ctx,
                     tool_ctx=tool_ctx,
                     emit=emit,
@@ -199,6 +227,7 @@ class AgentRunner:
         self,
         *,
         client: LLMClient,
+        fast_client: LLMClient,
         ctx: ConversationContext,
         tool_ctx: ToolContext,
         emit: Callable[[TraceEvent], None],
@@ -247,11 +276,14 @@ class AgentRunner:
             transient_error: Exception | None = None
             for attempt in range(1, outer_attempts + 1):
                 try:
-                    resp = await client.chat_with_tools(
+                    # Use the FAST client for tool-call decisions (the
+                    # high-volume cheap turn). max_tokens capped — the
+                    # response is just a tool_calls JSON, not prose.
+                    resp = await fast_client.chat_with_tools(
                         messages=ctx.to_openai(),
                         tools=self.registry.to_openai_specs(),
-                        temperature=self.preset.temperature,
-                        max_tokens=self.preset.max_tokens,
+                        temperature=self.fast_preset.temperature,
+                        max_tokens=min(self.fast_preset.max_tokens, AGENT_TOOL_TURN_MAX_TOKENS),
                     )
                     transient_error = None
                     break
@@ -350,13 +382,14 @@ class AgentRunner:
             )
 
         if not summary:
-            # Fall back: ask one more time for a finish summary
+            # Fall back to the MAIN (smarter) model for the final summary —
+            # this is the place where prose quality matters and is run once.
             try:
                 resp = await client.chat(
                     system_prompt="基于已收集的信息直接给出 Markdown 任务结论。",
                     user_prompt="请用一段简短 Markdown 总结当前任务的发现。",
                     schema_fields=None,
-                    max_tokens=600,
+                    max_tokens=800,
                 )
                 summary = resp.text.strip()
             except Exception:
