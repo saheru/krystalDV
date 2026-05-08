@@ -1,9 +1,10 @@
 """Main window — top bar + sidebar + stacked pages with cross-fade transitions."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QIcon, QKeySequence, QShortcut
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -88,13 +89,17 @@ class MainWindow(QMainWindow):
         slay.setSpacing(4)
 
         self._nav_buttons: dict[str, QPushButton] = {}
+        self._nav_group = QButtonGroup(self)
+        self._nav_group.setExclusive(True)
         for key, label in NAV_ITEMS:
             btn = QPushButton(label)
             btn.setProperty("navItem", True)
-            btn.setProperty("active", False)
+            btn.setCheckable(True)
+            btn.setAutoExclusive(False)
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda _=False, k=key: self._switch_to(k))
             self._nav_buttons[key] = btn
+            self._nav_group.addButton(btn)
             slay.addWidget(btn)
         slay.addStretch(1)
 
@@ -141,17 +146,14 @@ class MainWindow(QMainWindow):
     # ---- nav --------------------------------------------------------------
     def _switch_to(self, key: str) -> None:
         for k, btn in self._nav_buttons.items():
-            active = k == key
-            btn.setProperty("active", active)
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
+            btn.setChecked(k == key)
         idx = self._page_index[key]
         if self.stack.currentIndex() == idx:
             return
         self.stack.setCurrentIndex(idx)
-        # cross-fade the new page
-        from kdv.ui.animations import fade_in
-        fade_in(self.stack.currentWidget(), duration_ms=200)
+        # No page-level fade animation — Qt's QGraphicsOpacityEffect doesn't
+        # compose with the shadow effects on inner cards and visibly clips
+        # content in macOS. Subtle bubble/toast animations remain elsewhere.
 
     def _show_help(self) -> None:
         h.toast(

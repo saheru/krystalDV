@@ -20,18 +20,18 @@ from PySide6.QtWidgets import (
 from kdv.ui import style
 
 
-def make_card(parent: QWidget | None = None, *, padding: int = 16, shadow: bool = True) -> QFrame:
-    """A rounded white container with subtle shadow."""
+def make_card(parent: QWidget | None = None, *, padding: int = 16, shadow: bool = False) -> QFrame:
+    """A rounded white container.
+
+    The drop-shadow effect was removed: QWidget can hold only one
+    QGraphicsEffect at a time, and `fade_in` on parent widgets would
+    silently overwrite the shadow — leaving residual layout artefacts.
+    The QSS border on `QWidget[card="true"]` provides enough definition.
+    `shadow=` is kept for backward compatibility but defaults to False.
+    """
     f = QFrame(parent)
     f.setProperty("card", True)
     f.setAttribute(Qt.WA_StyledBackground, True)
-    # Visual styling comes from the global QSS rule on `QWidget[card="true"]`.
-    if shadow:
-        eff = QGraphicsDropShadowEffect(f)
-        eff.setBlurRadius(24)
-        eff.setOffset(0, 4)
-        eff.setColor(QColor(17, 24, 39, 22))
-        f.setGraphicsEffect(eff)
     lay = QVBoxLayout(f)
     lay.setContentsMargins(padding, padding, padding, padding)
     lay.setSpacing(12)

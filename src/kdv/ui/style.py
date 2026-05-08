@@ -60,15 +60,20 @@ QPushButton[navItem="true"] {{
     background: transparent;
     color: {TEXT_MUTED};
     font-size: 14px;
+    min-height: 22px;
 }}
-QPushButton[navItem="true"]:hover {{
+QPushButton[navItem="true"]:hover:!checked {{
     background: {ACCENT_SOFT};
     color: {PRIMARY};
 }}
-QPushButton[navItem="true"][active="true"] {{
+QPushButton[navItem="true"]:checked {{
     background: {PRIMARY};
     color: white;
     font-weight: 600;
+}}
+QPushButton[navItem="true"]:checked:hover {{
+    background: {PRIMARY_HOVER};
+    color: white;
 }}
 
 /* ====== Buttons ====== */
@@ -196,25 +201,25 @@ QTableWidget::item, QTableView::item {{
     border: none;
 }}
 
-/* ====== Lists ====== */
+/* ====== Lists ======
+ * Items are transparent / borderless. The widget INSIDE each item paints
+ * its own background + border + selection — that gives us pixel-perfect
+ * control without QSS padding clipping the content.
+ */
 QListWidget {{
     background: transparent;
     border: none;
+    outline: none;
 }}
 QListWidget::item {{
-    background: {BG_CARD};
-    border: 1px solid {BORDER};
-    border-radius: 10px;
-    padding: 12px 14px;
-    margin-bottom: 8px;
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin: 0;
 }}
-QListWidget::item:hover {{
-    border-color: {PRIMARY};
-}}
-QListWidget::item:selected {{
-    border: 2px solid {PRIMARY};
-    background: {ACCENT_SOFT};
-    color: {TEXT};
+QListWidget::item:hover, QListWidget::item:selected {{
+    background: transparent;
+    border: none;
 }}
 
 /* ====== Scrollbars ====== */

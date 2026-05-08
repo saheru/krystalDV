@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 
 import qasync
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal  # noqa: F401
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
@@ -28,16 +28,14 @@ from kdv.config.models import LLMPreset
 from kdv.config.store import SecretStore
 from kdv.llm.client import LLMClient
 from kdv.ui import helpers as h
-from kdv.ui.animations import fade_in
 from kdv.ui.state import AppState
 
 
-# Fixed list-item height — must include the QListWidget::item QSS padding (12px
-# vertical) and a few pixels of breathing room. 88 px renders the title row
-# (~24 px) + a hairline gap + the subtitle row (~18 px) without the item
-# border slicing through the second line of text.
-LIST_ITEM_HEIGHT = 88
-LIST_ITEM_INNER_HEIGHT = 60
+# QListWidget::item is fully transparent (see style.py) — the widget inside
+# paints its own card. This height is therefore the widget height + a small
+# spacing gap.
+LIST_ITEM_CARD_HEIGHT = 64
+LIST_ITEM_GAP = 8
 
 
 class ConfigPage(QWidget):
@@ -259,26 +257,24 @@ class ConfigPage(QWidget):
         )
         self._detail_holder_lay.addWidget(es)
         self._detail_holder_lay.addStretch(1)
-        fade_in(es)
 
     # ---- list -------------------------------------------------------------
     def _reload_list(self) -> None:
         self.list.clear()
         items = self.state.presets.list()
+        if not items:
+            self._current = None
+            self._show_empty()
+            return
+        target_id = self.state.settings.settings.last_preset_id or items[0].id
         for p in items:
             it = QListWidgetItem()
             it.setSizeHint(self._list_item_size())
             it.setData(Qt.UserRole, p.id)
             self.list.addItem(it)
-            w = self._render_list_item(p)
+            w = self._render_list_item(p, selected=p.id == target_id)
             self.list.setItemWidget(it, w)
 
-        if not items:
-            self._current = None
-            self._show_empty()
-            return
-
-        target_id = self.state.settings.settings.last_preset_id or items[0].id
         for i in range(self.list.count()):
             if self.list.item(i).data(Qt.UserRole) == target_id:
                 self.list.setCurrentRow(i)
@@ -288,45 +284,61 @@ class ConfigPage(QWidget):
     def _list_item_size(self):
         from PySide6.QtCore import QSize
 
-        return QSize(0, LIST_ITEM_HEIGHT)
+        return QSize(0, LIST_ITEM_CARD_HEIGHT + LIST_ITEM_GAP)
 
-    def _render_list_item(self, p: LLMPreset) -> QWidget:
-        w = QWidget()
-        w.setFixedHeight(LIST_ITEM_INNER_HEIGHT)
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(10, 8, 10, 8)
-        lay.setSpacing(2)
+    def _render_list_item(self, p: LLMPreset, *, selected: bool) -> QWidget:
+        from PySide6.QtGui import QFontMetrics
+        from PySide6.QtWidgets import QFrame
+
+        # The inner card paints background + border + selection.
+        card = QFrame()
+        card.setObjectName("presetCard")
+        card.setFixedHeight(LIST_ITEM_CARD_HEIGHT)
+        from kdv.ui import style as _st
+
+        border = _st.PRIMARY if selected else _st.BORDER
+        bg = _st.ACCENT_SOFT if selected else _st.BG_CARD
+        card.setStyleSheet(
+            f"#presetCard {{"
+            f"  background: {bg};"
+            f"  border: {2 if selected else 1}px solid {border};"
+            f"  border-radius: 10px;"
+            f"}}"
+        )
+
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(12, 8, 12, 8)
+        outer.setSpacing(2)
 
         head = QHBoxLayout()
         head.setSpacing(8)
+        head.setContentsMargins(0, 0, 0, 0)
         title = QLabel(p.name or "(未命名)")
-        title.setStyleSheet("font-weight: 600; font-size: 13px; background: transparent;")
+        title.setStyleSheet("font-weight: 600; font-size: 13px; background: transparent; border: none;")
         title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        title.setMaximumWidth(180)
         title.setTextFormat(Qt.PlainText)
         head.addWidget(title, 1)
-        kind = {"ok": "success", "fail": "danger", "unknown": "muted"}[p.last_test_status]
-        head.addWidget(
-            h.badge(
-                {"ok": "连通", "fail": "失败", "unknown": "未测"}[p.last_test_status],
-                kind,
-            )
-        )
-        lay.addLayout(head)
 
-        sub = QLabel(f"{p.model} · {p.base_url}")
+        kind = {"ok": "success", "fail": "danger", "unknown": "muted"}[p.last_test_status]
+        badge_lbl = h.badge(
+            {"ok": "连通", "fail": "失败", "unknown": "未测"}[p.last_test_status],
+            kind,
+        )
+        badge_lbl.setStyleSheet(badge_lbl.styleSheet() + " border: none;")
+        head.addWidget(badge_lbl)
+        outer.addLayout(head)
+
+        sub = QLabel()
         sub.setStyleSheet(
-            "color: #6B7280; font-size: 11px; background: transparent;"
+            "color: #6B7280; font-size: 11px; background: transparent; border: none;"
         )
         sub.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         sub.setTextFormat(Qt.PlainText)
-        # Manual elide to avoid the label overflowing past the list item bounds
-        from PySide6.QtGui import QFontMetrics
-
+        full = f"{p.model} · {p.base_url}"
         fm = QFontMetrics(sub.font())
-        sub.setText(fm.elidedText(sub.text(), Qt.ElideRight, 240))
-        lay.addWidget(sub)
-        return w
+        sub.setText(fm.elidedText(full, Qt.ElideRight, 240))
+        outer.addWidget(sub)
+        return card
 
     def _on_select(self) -> None:
         item = self.list.currentItem()
@@ -338,9 +350,17 @@ class ConfigPage(QWidget):
             return
         self._current = p
         self.state.settings.update(last_preset_id=pid)
+        # Re-render every list-item so only the chosen card shows the highlight.
+        for i in range(self.list.count()):
+            li = self.list.item(i)
+            other_id = li.data(Qt.UserRole)
+            other = self.state.presets.get(other_id)
+            if other:
+                self.list.setItemWidget(
+                    li, self._render_list_item(other, selected=other_id == pid)
+                )
         self._build_form()
         self._populate_form(p)
-        fade_in(self._detail_holder)
 
     def _populate_form(self, p: LLMPreset) -> None:
         self.name_input.setText(p.name)

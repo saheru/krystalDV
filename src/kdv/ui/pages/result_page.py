@@ -36,7 +36,6 @@ from kdv.agent.trace import TraceEvent
 from kdv.analysis.runner import RunResult
 from kdv.ui import helpers as h
 from kdv.ui import style
-from kdv.ui.animations import fade_in, slide_in
 from kdv.ui.state import AppState
 from kdv.viz import charts as ch
 from kdv.viz.column_stats import summarize_columns
@@ -245,7 +244,6 @@ class ResultPage(QWidget):
     def _add_chart_card_to_grid(self, card: QWidget) -> None:
         n = self._chart_grid.count()
         self._chart_grid.addWidget(card, n // 2, n % 2)
-        slide_in(card, direction="up", duration_ms=240)
 
     def _wrap_chart_card(self, title: str, rationale: str, body: QWidget) -> QWidget:
         card = h.make_card(padding=14)
@@ -430,7 +428,6 @@ class ResultPage(QWidget):
         wrapper_w.setLayout(wrapper)
         # Insert before the trailing stretch
         self._chat_messages_lay.insertWidget(self._chat_messages_lay.count() - 1, wrapper_w)
-        fade_in(wrapper_w, duration_ms=180)
         # Auto-scroll to bottom
         from PySide6.QtCore import QTimer
 

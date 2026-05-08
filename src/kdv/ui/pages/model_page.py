@@ -28,7 +28,6 @@ from kdv.analysis.model import AnalysisModel
 from kdv.excel.template import export_template_skeleton, load_output_template
 from kdv.llm.schema import FieldSpec
 from kdv.ui import helpers as h
-from kdv.ui.animations import fade_in
 from kdv.ui.state import AppState
 
 
@@ -91,32 +90,58 @@ class ModelPage(QWidget):
 
     # ---- list -------------------------------------------------------------
     def _reload_list(self) -> None:
+        from PySide6.QtCore import QSize
+
         self.list.clear()
         items = self.state.models.list()
-        for m in items:
-            it = QListWidgetItem()
-            self.list.addItem(it)
-            w = self._render_list_item(m)
-            it.setSizeHint(w.sizeHint())
-            self.list.setItemWidget(it, w)
-            it.setData(Qt.UserRole, m.id)
         if not items:
             self._show_empty()
             return
+        target_id = self.state.settings.settings.last_model_id or items[0].id
+        for m in items:
+            it = QListWidgetItem()
+            it.setSizeHint(QSize(0, 64 + 8))
+            it.setData(Qt.UserRole, m.id)
+            self.list.addItem(it)
+            w = self._render_list_item(m, selected=m.id == target_id)
+            self.list.setItemWidget(it, w)
+        for i in range(self.list.count()):
+            if self.list.item(i).data(Qt.UserRole) == target_id:
+                self.list.setCurrentRow(i)
+                return
         self.list.setCurrentRow(0)
 
-    def _render_list_item(self, m: AnalysisModel) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(4, 4, 4, 4)
-        lay.setSpacing(4)
+    def _render_list_item(self, m: AnalysisModel, *, selected: bool = False) -> QWidget:
+        from PySide6.QtWidgets import QFrame
+        from kdv.ui import style as _st
+
+        card = QFrame()
+        card.setObjectName("modelCard")
+        card.setFixedHeight(64)
+        border = _st.PRIMARY if selected else _st.BORDER
+        bg = _st.ACCENT_SOFT if selected else _st.BG_CARD
+        card.setStyleSheet(
+            f"#modelCard {{"
+            f"  background: {bg};"
+            f"  border: {2 if selected else 1}px solid {border};"
+            f"  border-radius: 10px;"
+            f"}}"
+        )
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(2)
         title = QLabel(m.name or "(未命名)")
-        title.setStyleSheet("font-weight: 600;")
+        title.setStyleSheet(
+            "font-weight: 600; font-size: 13px; background: transparent; border: none;"
+        )
+        title.setTextFormat(Qt.PlainText)
         lay.addWidget(title)
         sub = QLabel(f"{len(m.output_fields)} 个输出字段")
-        sub.setStyleSheet("color: #6B7280; font-size: 12px;")
+        sub.setStyleSheet(
+            "color: #6B7280; font-size: 11px; background: transparent; border: none;"
+        )
         lay.addWidget(sub)
-        return w
+        return card
 
     def _on_new(self) -> None:
         m = AnalysisModel()
@@ -138,9 +163,16 @@ class ModelPage(QWidget):
             return
         self._current = m
         self.state.settings.update(last_model_id=mid)
+        for i in range(self.list.count()):
+            li = self.list.item(i)
+            other_id = li.data(Qt.UserRole)
+            other = self.state.models.get(other_id)
+            if other:
+                self.list.setItemWidget(
+                    li, self._render_list_item(other, selected=other_id == mid)
+                )
         self._build_editor()
         self._populate_editor(m)
-        fade_in(self._right_holder)
 
     # ---- editor -----------------------------------------------------------
     def _show_empty(self) -> None:
