@@ -24,10 +24,8 @@ def make_card(parent: QWidget | None = None, *, padding: int = 16, shadow: bool 
     """A rounded white container with subtle shadow."""
     f = QFrame(parent)
     f.setProperty("card", True)
-    f.setStyleSheet(
-        f"QFrame[card='true'] {{ background: {style.BG_CARD}; border: 1px solid {style.BORDER}; "
-        "border-radius: 12px; }}"
-    )
+    f.setAttribute(Qt.WA_StyledBackground, True)
+    # Visual styling comes from the global QSS rule on `QWidget[card="true"]`.
     if shadow:
         eff = QGraphicsDropShadowEffect(f)
         eff.setBlurRadius(24)

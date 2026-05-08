@@ -70,19 +70,45 @@ python main.py
 pytest
 ```
 
-### 打包成 Windows 双击 exe（一键）
+### 打包
 
-在 Windows 上：
+#### 自动构建（推荐）—— GitHub Actions
+
+仓库已配置好 `.github/workflows/`：
+
+| 工作流 | 触发 | 产物 |
+| --- | --- | --- |
+| `build-windows.yml` | push 到 main / 打 `v*` tag / 手动触发 | `kdv-windows.zip` |
+| `build-mac.yml` | push 到 main / 打 `v*` tag / 手动触发 | `kdv-mac.zip` (Apple Silicon) |
+
+每次 push 后到 GitHub 仓库的 **Actions 标签页**，点对应 workflow 的最新一次运行 → 滚到底部 **Artifacts** 区下载 zip。打 `v*` 标签（如 `git tag v0.1.0 && git push --tags`）会自动创建带 zip 附件的 GitHub Release。
+
+#### 本地构建
+
+**Windows**（必须在 Windows 机器上跑，PyInstaller 不支持交叉编译）：
 
 ```cmd
 build\build_windows.bat
 ```
 
+**macOS**：
+
+```bash
+bash build/build_mac.sh
+```
+
 完成后：
-- `dist\kdv\kdv.exe` —— 直接双击运行
-- `dist\kdv.zip` —— 发给最终用户
+- Windows: `dist\kdv\kdv.exe` + `dist\kdv.zip`
+- macOS: `dist/kdv.app` + `dist/kdv-mac.zip`
 
 详见 [`build/README_BUILD.md`](build/README_BUILD.md)。
+
+### Mac 用户首次启动提示
+
+未签名的 .app 在别人 Mac 上首次打开会被 Gatekeeper 拦截。两种解法：
+
+- 终端执行（推荐，一次性）：`xattr -dr com.apple.quarantine /Applications/kdv.app`
+- 或：右键 .app → **打开** → 弹窗里点"打开"，之后双击可正常启动
 
 ## 项目结构
 

@@ -18,6 +18,7 @@ build/__pycache__/
 build/*.toc
 build/*.pkg
 build/build/
+build/kdv/
 dist/
 
 # Editor / OS
@@ -31,9 +32,9 @@ Thumbs.db
 .env.local
 *.local.json
 
-# Generated icons (regenerate with build/make_icon.py)
-# (kept-out so the repo stays small; regenerate on the dev machine)
+# Generated icons (regenerate with build/make_icon.py; CI regenerates them too)
 assets/icons/kdv.ico
+assets/icons/kdv.icns
 
 # Tests
 .coverage

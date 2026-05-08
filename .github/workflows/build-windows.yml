@@ -1,0 +1,75 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install pyinstaller pillow
+
+      - name: Generate icons
+        shell: pwsh
+        run: python build/make_icon.py
+
+      - name: Run unit tests
+        shell: pwsh
+        run: python -m pytest -q
+
+      - name: Build with PyInstaller
+        shell: pwsh
+        run: pyinstaller build/kdv.spec --clean --noconfirm
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\kdv\kdv.exe")) {
+            Write-Error "dist\kdv\kdv.exe not found"
+            exit 1
+          }
+          Get-Item "dist\kdv\kdv.exe" | Format-List FullName, Length
+
+      - name: Zip distribution
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist\kdv\*" -DestinationPath "dist\kdv-windows.zip" -Force
+          Get-Item "dist\kdv-windows.zip" | Format-List FullName, Length
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kdv-windows
+          path: dist/kdv-windows.zip
+          retention-days: 30
+
+      - name: Attach to GitHub Release (only on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/kdv-windows.zip
+          generate_release_notes: true

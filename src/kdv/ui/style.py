@@ -27,7 +27,7 @@ INFO = "#3B82F6"
 GLOBAL_QSS = f"""
 /* ====== Base ====== */
 * {{
-    font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", "Inter", sans-serif;
+    font-family: "PingFang SC", "Helvetica Neue", "Microsoft YaHei", "Segoe UI", "Inter", sans-serif;
     font-size: 13px;
     color: {TEXT};
 }}

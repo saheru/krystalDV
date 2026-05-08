@@ -1,24 +1,29 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for Krystal Data Vision.
+"""PyInstaller spec for Krystal Data Vision (Windows + macOS).
 
-Build (on Windows):
+Windows build:
     pip install -e ".[dev]"
     pyinstaller build/kdv.spec --clean --noconfirm
+    -> dist/kdv/kdv.exe   (double-click; no terminal)
 
-Output:
-    dist/kdv/kdv.exe        ← double-click to launch (no terminal)
-    dist/kdv/_internal/...  ← bundled Python + libs
+macOS build:
+    pip install -e ".[dev]"
+    pyinstaller build/kdv.spec --clean --noconfirm
+    -> dist/kdv.app       (double-click)
+    -> dist/kdv/          (raw onefolder, can ignore)
 
-Distribute the entire `dist/kdv` folder to clients (zip it). The user just
-double-clicks `kdv.exe` — no Python install needed, no terminal, no server.
+The same spec auto-detects the host OS and produces the appropriate bundle.
+PyInstaller cannot cross-compile — run on Windows for .exe, on Mac for .app.
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
+IS_MAC = sys.platform == "darwin"
+IS_WIN = sys.platform == "win32"
 
 # --- paths ---------------------------------------------------------------
 SPEC_DIR = Path(SPECPATH).resolve()
@@ -37,11 +42,13 @@ if ASSETS.exists():
             rel = f.parent.relative_to(PROJECT_ROOT)
             datas.append((str(f), str(rel)))
 
-# matplotlib data (mpl-data) and openpyxl/styles
 datas += collect_data_files("matplotlib")
 datas += collect_data_files("openpyxl")
 datas += collect_data_files("pyqtgraph")
-datas += collect_data_files("qtawesome")
+try:
+    datas += collect_data_files("qtawesome")
+except Exception:
+    pass
 
 # --- hidden imports -----------------------------------------------------
 hiddenimports = []
@@ -102,10 +109,16 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-# Resolve icon path (used on Windows for the exe)
-icon_path = ASSETS / "icons" / "kdv.ico"
-icon_arg = str(icon_path) if icon_path.exists() else None
+# --- icon resolution ----------------------------------------------------
+icon_arg = None
+if IS_WIN:
+    p = ASSETS / "icons" / "kdv.ico"
+    icon_arg = str(p) if p.exists() else None
+elif IS_MAC:
+    p = ASSETS / "icons" / "kdv.icns"
+    icon_arg = str(p) if p.exists() else None
 
+# --- exe + collect ------------------------------------------------------
 exe = EXE(
     pyz,
     a.scripts,
@@ -116,7 +129,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=False,           # ← no terminal window — pure GUI
+    console=False,           # GUI only — no terminal window
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -135,3 +148,33 @@ coll = COLLECT(
     upx_exclude=[],
     name="kdv",
 )
+
+# --- macOS .app bundle --------------------------------------------------
+if IS_MAC:
+    app = BUNDLE(
+        coll,
+        name="kdv.app",
+        icon=icon_arg,
+        bundle_identifier="com.krystaldatavision.kdv",
+        info_plist={
+            "CFBundleName": "Krystal Data Vision",
+            "CFBundleDisplayName": "Krystal Data Vision",
+            "CFBundleShortVersionString": "0.1.0",
+            "CFBundleVersion": "0.1.0",
+            "NSHighResolutionCapable": True,
+            # Don't show in Dock as a separate "python" — this is a real app.
+            "LSApplicationCategoryType": "public.app-category.productivity",
+            "NSRequiresAquaSystemAppearance": False,  # follow system theme
+            # Excel file association (optional, lets users drag-drop xlsx onto the app)
+            "CFBundleDocumentTypes": [
+                {
+                    "CFBundleTypeName": "Excel Workbook",
+                    "CFBundleTypeRole": "Viewer",
+                    "LSItemContentTypes": [
+                        "org.openxmlformats.spreadsheetml.sheet",
+                        "com.microsoft.excel.xls",
+                    ],
+                }
+            ],
+        },
+    )
