@@ -522,9 +522,10 @@ class ConfigPage(QWidget):
         ok = False
         msg = ""
         try:
+            fc_support = "unknown"
             try:
                 async with LLMClient(p, self.state.get_api_key(p)) as client:
-                    ok, msg = await asyncio.wait_for(
+                    ok, msg, fc_support = await asyncio.wait_for(
                         client.test_connection(), timeout=wall_clock
                     )
             except asyncio.TimeoutError:
@@ -536,6 +537,8 @@ class ConfigPage(QWidget):
             p.last_test_status = "ok" if ok else "fail"
             p.last_test_message = msg
             p.last_test_at = datetime.utcnow().isoformat()
+            if ok:
+                p.fc_support = fc_support  # type: ignore[assignment]
             try:
                 self.state.presets.upsert(p)
             except Exception:

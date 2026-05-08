@@ -82,8 +82,13 @@ class LLMClient:
             self._http = None
 
     # ------------------------------------------------------------------
-    async def test_connection(self) -> tuple[bool, str]:
-        """Send a tiny chat completion to verify base URL/key/model."""
+    async def test_connection(self) -> tuple[bool, str, str]:
+        """Send a tiny chat completion to verify base URL/key/model.
+
+        Returns `(ok, message, fc_support)` where fc_support is one of
+        "yes" / "no" / "unknown". The function-calling probe is best-effort
+        and never fails the connection test.
+        """
         try:
             resp = await self.chat(
                 system_prompt="You are a helper. Reply with a single word.",
@@ -93,14 +98,75 @@ class LLMClient:
                 max_tokens=8,
             )
             text = (resp.text or "").strip()[:80]
-            return True, f"连接成功，模型回复：{text or '<empty>'}"
         except LLMError as e:
-            return False, f"连接失败：{e}"
+            return False, f"连接失败：{e}", "unknown"
         except RetryableLLMError as e:
-            return False, f"连接失败（可重试）：{e}"
+            return False, f"连接失败（可重试）：{e}", "unknown"
         except Exception as e:  # pragma: no cover
             logger.exception("test_connection unexpected error")
-            return False, f"连接失败：{e}"
+            return False, f"连接失败：{e}", "unknown"
+
+        fc = await self._probe_function_calling()
+        suffix = {
+            "yes": " · 支持工具调用 ✅（Agent 模式可用）",
+            "no": " · 不支持工具调用 ⚠（Agent 模式不可用，请用其他模式）",
+            "unknown": "",
+        }[fc]
+        return True, f"连接成功，模型回复：{text or '<empty>'}{suffix}", fc
+
+    async def _probe_function_calling(self) -> str:
+        """Send a minimal tool-using request and check if proxy honours it.
+
+        Returns "yes" if the response includes a tool_call; "no" if the
+        proxy returns 400/empty/text-only; "unknown" if we couldn't tell.
+        """
+        if self._http is None:
+            return "unknown"
+        probe_tool = {
+            "type": "function",
+            "function": {
+                "name": "echo",
+                "description": "Echo back the user's input as-is.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+            },
+        }
+        body = {
+            "model": self.preset.model,
+            "messages": [
+                {"role": "user", "content": "Please call echo with text='ok'."},
+            ],
+            "temperature": 0,
+            "max_tokens": 64,
+            "tools": [probe_tool],
+            "tool_choice": {"type": "function", "function": {"name": "echo"}},
+            "stream": False,
+        }
+        try:
+            r = await self._http.post("/chat/completions", json=body)
+        except Exception:
+            return "unknown"
+        if r.status_code >= 400:
+            return "no"
+        try:
+            data = r.json()
+        except (json.JSONDecodeError, ValueError):
+            # Empty body / non-JSON 200 → strong signal proxy dropped the tools.
+            return "no"
+        try:
+            msg = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError):
+            return "unknown"
+        tcs = msg.get("tool_calls") or []
+        if tcs:
+            return "yes"
+        # If no tool_calls came back, model didn't call the tool — treat
+        # as no FC support (a working FC stack would have called it given
+        # `tool_choice` forces it).
+        return "no"
 
     # ------------------------------------------------------------------
     async def chat(

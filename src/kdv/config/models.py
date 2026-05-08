@@ -43,6 +43,9 @@ class LLMPreset(BaseModel):
     last_test_status: Literal["unknown", "ok", "fail"] = "unknown"
     last_test_message: str = ""
     last_test_at: str = ""
+    # Whether this endpoint supports OpenAI-style function calling.
+    # Probed by 测试连接 button; required for Agent mode to work.
+    fc_support: Literal["unknown", "yes", "no"] = "unknown"
     created_at: str = Field(default_factory=_now)
     updated_at: str = Field(default_factory=_now)
 

@@ -358,12 +358,18 @@ class NewAgentJobDialog(QDialog):
         self.preset_picker = QComboBox()
         self.preset_picker.setMinimumHeight(36)
         for p in self.state.presets.list():
-            self.preset_picker.addItem(f"{p.name} · {p.model}", p.id)
+            badge = ""
+            if p.fc_support == "no":
+                badge = "  ⚠ 不支持工具调用"
+            elif p.fc_support == "unknown":
+                badge = "  ⚪ 工具调用未测试"
+            self.preset_picker.addItem(f"{p.name} · {p.model}{badge}", p.id)
         cur_p = self.state.selected_preset()
         if cur_p:
             i = self.preset_picker.findData(cur_p.id)
             if i >= 0:
                 self.preset_picker.setCurrentIndex(i)
+        self.preset_picker.currentIndexChanged.connect(self._refresh_fc_warning)
 
         # Data upload row
         data_row = QHBoxLayout()
@@ -391,12 +397,56 @@ class NewAgentJobDialog(QDialog):
         form.addRow("任务列表", self.tasks_input)
         lay.addLayout(form)
 
+        # FC-support warning banner — shown only when the chosen preset
+        # is known not to support OpenAI function calling.
+        self._fc_warning = QLabel()
+        self._fc_warning.setWordWrap(True)
+        self._fc_warning.setVisible(False)
+        self._fc_warning.setStyleSheet(
+            "background: #FEF2F2; color: #991B1B; "
+            "border: 1px solid #FCA5A5; border-radius: 8px; "
+            "padding: 10px 14px; font-size: 12px; line-height: 1.6;"
+        )
+        lay.addWidget(self._fc_warning)
+        self._refresh_fc_warning()
+
         btns = QDialogButtonBox(QDialogButtonBox.Cancel)
         self.start_btn = h.primary_button("启动 Agent")
         self.start_btn.clicked.connect(self.accept)
         btns.addButton(self.start_btn, QDialogButtonBox.AcceptRole)
         btns.rejected.connect(self.reject)
         lay.addWidget(btns)
+
+    def _refresh_fc_warning(self) -> None:
+        if not hasattr(self, "_fc_warning"):
+            return
+        pid = self.preset_picker.currentData()
+        p = self.state.presets.get(pid) if pid else None
+        if p is None:
+            self._fc_warning.setVisible(False)
+            return
+        if p.fc_support == "no":
+            self._fc_warning.setText(
+                "⚠ <b>该 LLM 配置不支持 OpenAI function calling</b>。"
+                "Agent 模式必须依赖工具调用——这次任务大概率会失败。<br>"
+                "建议：改用 OpenAI / DeepSeek / 智谱 GLM 等支持工具调用的端点；"
+                "或用『运行分析』里的逐行/汇总模式（Agent 之外的模式不需要 function calling）。"
+            )
+            self._fc_warning.setTextFormat(Qt.RichText)
+            self._fc_warning.setVisible(True)
+        elif p.fc_support == "unknown":
+            self._fc_warning.setText(
+                "⚪ 该 LLM 配置尚未测试是否支持工具调用。Agent 模式依赖此能力——"
+                "建议先到『LLM 配置』页点『测试连接』验证再来运行。"
+            )
+            self._fc_warning.setStyleSheet(
+                "background: #FFFBEB; color: #92400E; "
+                "border: 1px solid #FCD34D; border-radius: 8px; "
+                "padding: 10px 14px; font-size: 12px; line-height: 1.6;"
+            )
+            self._fc_warning.setVisible(True)
+        else:
+            self._fc_warning.setVisible(False)
 
     def _on_upload(self) -> None:
         path, _ = QFileDialog.getOpenFileName(

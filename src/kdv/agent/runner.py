@@ -221,28 +221,69 @@ class AgentRunner:
             if ctx.needs_compaction():
                 emit(TraceEvent(kind="compaction",
                                 text=f"上下文 {ctx.total_tokens()} tokens 接近预算，压缩中…"))
-                try:
-                    await ctx.compact_async(async_summarizer)
-                except Exception as e:  # noqa: BLE001
-                    logger.exception("compaction failed")
-                    emit(TraceEvent(kind="error", text=f"压缩失败：{e}"))
+                # Try compaction with retries on transient errors. If it
+                # ultimately fails, just continue with un-compacted context
+                # — the next chat call may still succeed if the network
+                # blip clears up.
+                for cc_attempt in range(1, 4):
+                    try:
+                        await ctx.compact_async(async_summarizer)
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        if cc_attempt == 3:
+                            logger.exception("compaction failed after retries")
+                            emit(TraceEvent(kind="error",
+                                            text=f"压缩失败（已重试 3 次）：{e}"))
+                            break
+                        emit(TraceEvent(
+                            kind="error",
+                            text=f"压缩失败重试中（第 {cc_attempt} 次）：{str(e)[:80]}",
+                        ))
+                        await asyncio.sleep(2 * cc_attempt)
 
-            # ---- LLM call -----------------------------------------------
-            try:
-                resp = await client.chat_with_tools(
-                    messages=ctx.to_openai(),
-                    tools=self.registry.to_openai_specs(),
-                    temperature=self.preset.temperature,
-                    max_tokens=self.preset.max_tokens,
-                )
-            except LLMError as e:
-                abort_reason = f"llm_error: {e}"
-                emit(TraceEvent(kind="error", text=str(e)))
-                break
-            except Exception as e:  # noqa: BLE001
-                abort_reason = f"unexpected: {e}"
-                logger.exception("agent step crashed")
-                emit(TraceEvent(kind="error", text=str(e)))
+            # ---- LLM call (with extra outer retry for transient blips) -
+            resp = None
+            outer_attempts = 4
+            transient_error: Exception | None = None
+            for attempt in range(1, outer_attempts + 1):
+                try:
+                    resp = await client.chat_with_tools(
+                        messages=ctx.to_openai(),
+                        tools=self.registry.to_openai_specs(),
+                        temperature=self.preset.temperature,
+                        max_tokens=self.preset.max_tokens,
+                    )
+                    transient_error = None
+                    break
+                except LLMError as e:
+                    abort_reason = f"llm_error: {e}"
+                    emit(TraceEvent(kind="error", text=str(e)))
+                    transient_error = None
+                    resp = None
+                    break
+                except Exception as e:  # noqa: BLE001
+                    transient_error = e
+                    msg = str(e)
+                    looks_transient = any(
+                        s in msg for s in ("SSL", "网络", "超时", "TimeoutException", "RemoteProtocol", "OSError")
+                    )
+                    if not looks_transient or attempt == outer_attempts:
+                        # give up
+                        abort_reason = f"unexpected: {e}"
+                        logger.exception("agent step crashed (final)")
+                        emit(TraceEvent(kind="error", text=str(e)))
+                        break
+                    logger.warning(
+                        "agent step transient error %d/%d: %s; backing off",
+                        attempt, outer_attempts, e,
+                    )
+                    emit(TraceEvent(
+                        kind="error",
+                        text=f"传输错误（第 {attempt} 次重试）：{msg[:120]}",
+                    ))
+                    await asyncio.sleep(min(2 ** attempt, 12))
+            if resp is None:
+                # we already emitted the error in the loop; break the step loop
                 break
 
             prompt_tokens += resp.prompt_tokens

@@ -230,11 +230,13 @@ class MainWindow(QMainWindow):
                     duration_ms=10000,
                 )
             elif job.status == "error":
+                # Show a longer chunk of the error so the user can see
+                # what to fix (especially the "no function calling" hint).
                 h.toast(
                     self,
-                    f"Agent 「{job.name}」 出错：{job.error[:80]}",
+                    f"Agent 「{job.name}」 出错：{job.error[:240]}",
                     "danger",
-                    duration_ms=6000,
+                    duration_ms=12000,
                 )
             elif job.status == "cancelled":
                 h.toast(

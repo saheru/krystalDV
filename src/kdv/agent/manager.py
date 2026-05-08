@@ -108,7 +108,19 @@ class AgentJob(QObject):
                 self._set_status("done")
         except Exception as e:  # noqa: BLE001
             logger.exception("agent job %s crashed", self.id)
-            self.error = str(e)
+            raw = str(e)
+            # Detect the "proxy ate the tools" pattern and rewrite the
+            # error message into something actionable.
+            if "<empty body>" in raw or (
+                "function" in raw.lower() and "200" in raw
+            ):
+                self.error = (
+                    "此 LLM 配置不支持 OpenAI function calling，Agent 模式无法运行。"
+                    "请换成 OpenAI / DeepSeek / 智谱 GLM 等支持工具调用的端点，"
+                    "或在『运行分析』页用逐行/汇总模式（不需要工具调用）。"
+                )
+            else:
+                self.error = raw
             self._set_status("error")
         finally:
             self.finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
