@@ -1,6 +1,8 @@
 """Config page — manage LLM presets (base url, key, model, params)."""
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime
 
 import qasync
@@ -30,8 +32,12 @@ from kdv.ui.animations import fade_in
 from kdv.ui.state import AppState
 
 
-# Fixed list-item height so two-line content always fits without overlap.
-LIST_ITEM_HEIGHT = 64
+# Fixed list-item height — must include the QListWidget::item QSS padding (12px
+# vertical) and a few pixels of breathing room. 88 px renders the title row
+# (~24 px) + a hairline gap + the subtitle row (~18 px) without the item
+# border slicing through the second line of text.
+LIST_ITEM_HEIGHT = 88
+LIST_ITEM_INNER_HEIGHT = 60
 
 
 class ConfigPage(QWidget):
@@ -141,8 +147,17 @@ class ConfigPage(QWidget):
         self.temp_input.setDecimals(2)
 
         self.maxtok_input = QSpinBox()
-        self.maxtok_input.setRange(64, 32768)
-        self.maxtok_input.setSingleStep(128)
+        self.maxtok_input.setRange(256, 131072)
+        self.maxtok_input.setSingleStep(512)
+        self.maxtok_input.setToolTip(
+            "LLM 单次回复的最大 token 数（输出上限）。\n"
+            "建议值：\n"
+            "  · 逐行结构化分析（字段不多）：1024–2048\n"
+            "  · 字段多/描述长：2048–4096\n"
+            "  · 整表汇总长篇 Markdown：4096–8192（程序自动至少 4096）\n"
+            "  · 大型多维报告：8192–16384\n"
+            "调大不会浪费成本——它只是上限，实际计费按 LLM 真实输出。"
+        )
 
         self.timeout_input = QSpinBox()
         self.timeout_input.setRange(5, 600)
@@ -273,12 +288,11 @@ class ConfigPage(QWidget):
     def _list_item_size(self):
         from PySide6.QtCore import QSize
 
-        # Wider than the column so eliding kicks in instead of clipping behind scrollbar
         return QSize(0, LIST_ITEM_HEIGHT)
 
     def _render_list_item(self, p: LLMPreset) -> QWidget:
         w = QWidget()
-        w.setFixedHeight(LIST_ITEM_HEIGHT - 4)
+        w.setFixedHeight(LIST_ITEM_INNER_HEIGHT)
         lay = QVBoxLayout(w)
         lay.setContentsMargins(10, 8, 10, 8)
         lay.setSpacing(2)
@@ -405,22 +419,39 @@ class ConfigPage(QWidget):
     async def _on_test(self) -> None:
         if not self._current:
             return
-        # save first so the test reflects the form
         self._on_save()
         p = self._current
+        # Hard wall-clock timeout — even if the proxy hangs forever, the UI
+        # button will recover. preset.timeout × 2 + 5s slack covers retries.
+        wall_clock = max(15, p.timeout_seconds * 2 + 5)
+
         self.test_btn.setEnabled(False)
         self.test_btn.setText("测试中…")
+        ok = False
+        msg = ""
         try:
-            async with LLMClient(p, self.state.get_api_key(p)) as client:
-                ok, msg = await client.test_connection()
-        except Exception as e:  # noqa: BLE001
-            ok, msg = False, str(e)
-        p.last_test_status = "ok" if ok else "fail"
-        p.last_test_message = msg
-        p.last_test_at = datetime.utcnow().isoformat()
-        self.state.presets.upsert(p)
-        self._populate_form(p)
-        self._reload_list()
-        h.toast(self.window(), msg, "success" if ok else "danger")
-        self.test_btn.setEnabled(True)
-        self.test_btn.setText("测试连接")
+            try:
+                async with LLMClient(p, self.state.get_api_key(p)) as client:
+                    ok, msg = await asyncio.wait_for(
+                        client.test_connection(), timeout=wall_clock
+                    )
+            except asyncio.TimeoutError:
+                ok, msg = False, f"测试超时（{wall_clock}s 内未返回，建议检查 base URL / 网络 / 模型 ID 是否正确）"
+            except Exception as e:  # noqa: BLE001
+                logging.exception("test_connection failed")
+                ok, msg = False, f"测试失败：{e}"
+
+            p.last_test_status = "ok" if ok else "fail"
+            p.last_test_message = msg
+            p.last_test_at = datetime.utcnow().isoformat()
+            try:
+                self.state.presets.upsert(p)
+            except Exception:
+                logging.exception("failed to persist preset after test")
+            self._populate_form(p)
+            self._reload_list()
+            h.toast(self.window(), msg, "success" if ok else "danger")
+        finally:
+            # ALWAYS restore the button so the user isn't stuck.
+            self.test_btn.setEnabled(True)
+            self.test_btn.setText("测试连接")

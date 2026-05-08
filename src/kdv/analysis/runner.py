@@ -261,11 +261,13 @@ class AnalysisRunner:
                         use_function_calling=False,
                     )
                     try:
+                        # Summary reports are long-form Markdown; ensure plenty
+                        # of headroom regardless of the per-row preset value.
                         resp = await client.chat(
                             system_prompt=sys_p,
                             user_prompt=user_p,
                             schema_fields=None,
-                            max_tokens=max(2048, self.preset.max_tokens),
+                            max_tokens=max(4096, self.preset.max_tokens),
                         )
                         summary_md = resp.text or None
                         prompt_total += resp.prompt_tokens

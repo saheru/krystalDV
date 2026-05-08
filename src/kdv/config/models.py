@@ -25,7 +25,9 @@ class LLMPreset(BaseModel):
     base_url: str = "https://api.openai.com/v1"
     model: str = "gpt-4o-mini"
     temperature: float = 0.2
-    max_tokens: int = 2048
+    # Output token cap. Used directly for per-row analysis; summary mode
+    # automatically lifts this to at least 4096 so long reports aren't truncated.
+    max_tokens: int = 4096
     timeout_seconds: int = 60
     max_concurrency: int = 5
     max_retries: int = 3
