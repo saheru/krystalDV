@@ -80,6 +80,35 @@ def build_tool_spec(fields: list[FieldSpec], tool_name: str = "emit_analysis") -
     }
 
 
+def build_batch_tool_spec(
+    fields: list[FieldSpec], tool_name: str = "emit_batch"
+) -> dict[str, Any]:
+    """Tool spec for batch-mode: returns `{results: [<row_obj>, ...]}`."""
+    item_schema = json_schema_from_fields(fields)
+    return {
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "description": (
+                "输出本批次每条数据的结构化分析结果。results 数组长度必须严格等于"
+                "输入条数，顺序与输入一一对应。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "results": {
+                        "type": "array",
+                        "items": item_schema,
+                        "description": "每条数据一个对象，按输入顺序排列",
+                    },
+                },
+                "required": ["results"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
 def schema_describe_for_prompt(fields: list[FieldSpec]) -> str:
     """Produce a human-readable schema description for prompt fallback."""
     lines = []

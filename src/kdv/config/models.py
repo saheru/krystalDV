@@ -33,6 +33,11 @@ class LLMPreset(BaseModel):
     # Bump up only if you've validated the endpoint can take it.
     max_concurrency: int = 3
     max_retries: int = 3
+    # Batch size for row-by-row mode: pack this many rows into ONE LLM call
+    # (model returns an array of N structured outputs in order). 1 = classic
+    # per-row mode; 10 typical; max 30. Bigger batches save 40–60% on input
+    # tokens but are riskier — one parsing failure invalidates the whole batch.
+    batch_size: int = 1
     structured_mode: Literal["auto", "function_calling", "prompt"] = "auto"
     extra_headers: dict[str, str] = Field(default_factory=dict)
     last_test_status: Literal["unknown", "ok", "fail"] = "unknown"

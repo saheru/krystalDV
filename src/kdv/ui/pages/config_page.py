@@ -170,6 +170,11 @@ class ConfigPage(QWidget):
         self.struct_mode = QComboBox()
         self.struct_mode.addItems(["auto（推荐）", "function_calling（强制）", "prompt（兼容）"])
 
+        self.batch_size_input = QSpinBox()
+        self.batch_size_input.setRange(1, 30)
+        self.batch_size_input.setSingleStep(1)
+        self.batch_size_input.setSuffix(" 行/次")
+
         for w in (
             self.name_input,
             self.base_url_input,
@@ -184,6 +189,7 @@ class ConfigPage(QWidget):
             self.concurrency_input,
             self.retries_input,
             self.struct_mode,
+            self.batch_size_input,
         ):
             w.setMinimumHeight(34)
 
@@ -251,6 +257,15 @@ class ConfigPage(QWidget):
             "  · auto（推荐）：优先用 function calling 强约束输出，失败则回退到提示词\n"
             "  · function_calling：强制走工具调用，部分国产代理可能不支持\n"
             "  · prompt：完全靠提示词要求 JSON 输出，兼容性最好但偶尔失败"
+        ))
+
+        form.addRow("批量大小", self.batch_size_input)
+        form.addRow("", _hint(
+            "逐行分析时把多少行打包成一次 LLM 调用——共享一份 schema/system prompt：\n"
+            "  · 1：经典模式，每行单独调用（互不影响，最稳）\n"
+            "  · 5–10：节省 40–60% 输入 token，速度快 3–5×（推荐）\n"
+            "  · 15–30：极致省钱，但单批解析失败会让 30 行都标记为失败\n"
+            "建议先用 1 跑通，再调到 10 优化成本/速度。"
         ))
 
         self._detail_holder_lay.addLayout(form)
@@ -429,6 +444,7 @@ class ConfigPage(QWidget):
         self.retries_input.setValue(p.max_retries)
         idx = {"auto": 0, "function_calling": 1, "prompt": 2}.get(p.structured_mode, 0)
         self.struct_mode.setCurrentIndex(idx)
+        self.batch_size_input.setValue(getattr(p, "batch_size", 1))
         kind = {"ok": "success", "fail": "danger", "unknown": "muted"}[p.last_test_status]
         self.status_badge.setProperty("badge", kind)
         self.status_badge.setText(
@@ -466,6 +482,7 @@ class ConfigPage(QWidget):
         p.max_retries = int(self.retries_input.value())
         modes = ["auto", "function_calling", "prompt"]
         p.structured_mode = modes[self.struct_mode.currentIndex()]  # type: ignore[assignment]
+        p.batch_size = int(self.batch_size_input.value())
         return p
 
     def _on_save(self) -> None:

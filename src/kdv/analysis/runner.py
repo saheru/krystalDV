@@ -22,7 +22,12 @@ from kdv.analysis.concurrency import TaskOutcome, run_bounded
 from kdv.analysis.model import AnalysisModel
 from kdv.config.models import LLMPreset
 from kdv.llm.client import LLMClient, LLMError
-from kdv.llm.prompts import SYSTEM_TEMPLATES, build_row_prompt, build_summary_prompt
+from kdv.llm.prompts import (
+    SYSTEM_TEMPLATES,
+    build_batch_prompt,
+    build_row_prompt,
+    build_summary_prompt,
+)
 from kdv.llm.tokens import context_window_for, estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -136,22 +141,47 @@ class AnalysisRunner:
             cancelled = False
 
             if mode in ("row_by_row", "both"):
+                batch_size = max(1, getattr(self.preset, "batch_size", 1))
                 async with LLMClient(self.preset, self.api_key) as client:
                     completed = 0
+                    completed_lock = asyncio.Lock()
 
-                    def _build_task(idx: int):
+                    # Build per-row indices grouped into batches.
+                    # Skip rows that already have valid cached output.
+                    row_groups: list[list[int]] = []
+                    cur: list[int] = []
+                    for i in range(len(rows)):
+                        h = hash_row(rows[i])
+                        cached = cache.get_row(run_id, i, h)
+                        if cached is not None:
+                            row_outputs[i] = cached
+                            continue
+                        cur.append(i)
+                        if len(cur) >= batch_size:
+                            row_groups.append(cur)
+                            cur = []
+                    if cur:
+                        row_groups.append(cur)
+
+                    def _emit_progress(idx: int, dur_ms: int, err: str | None) -> None:
+                        if on_progress is None:
+                            return
+                        on_progress(
+                            RunProgress(
+                                completed=completed,
+                                total=len(rows),
+                                last_index=idx,
+                                last_error=err,
+                                last_duration_ms=dur_ms,
+                                prompt_tokens_total=prompt_total,
+                                completion_tokens_total=completion_total,
+                            )
+                        )
+
+                    def _build_single_task(idx: int):
                         async def _do() -> dict[str, Any]:
                             row = rows[idx]
                             h = hash_row(row)
-                            cached = cache.get_row(run_id, idx, h)
-                            if cached is not None:
-                                return {
-                                    "output": cached,
-                                    "prompt_tokens": 0,
-                                    "completion_tokens": 0,
-                                    "input_hash": h,
-                                    "from_cache": True,
-                                }
                             sys_p, user_p = build_row_prompt(
                                 system_extra=self._system_prompt(),
                                 analysis_goal=self._analysis_goal(),
@@ -167,8 +197,6 @@ class AnalysisRunner:
                                 schema_fields=self._output_fields(),
                             )
                             if resp.parsed is None:
-                                # Surface the actual model output (often empty / a refusal)
-                                # so the user can see what went wrong.
                                 snippet = (resp.text or "")[:200] or "<空>"
                                 raise LLMError(
                                     f"LLM 未返回可解析的结构化结果。原始回复：{snippet}"
@@ -178,32 +206,64 @@ class AnalysisRunner:
                                 "prompt_tokens": resp.prompt_tokens,
                                 "completion_tokens": resp.completion_tokens,
                                 "input_hash": h,
-                                "from_cache": False,
                             }
 
                         return _do
 
-                    def _on_progress(outcome: TaskOutcome) -> None:
-                        nonlocal completed, prompt_total, completion_total
-                        completed += 1
-                        if outcome.error:
-                            row_errors[outcome.index] = outcome.error
-                            cache.put_row(
-                                run_id,
-                                outcome.index,
-                                input_hash=hash_row(rows[outcome.index]),
-                                output=None,
-                                error=outcome.error,
-                                duration_ms=outcome.duration_ms,
+                    def _build_batch_task(indices: list[int]):
+                        async def _do() -> dict[str, Any]:
+                            batch_rows = [rows[i] for i in indices]
+                            sys_p, user_p = build_batch_prompt(
+                                system_extra=self._system_prompt(),
+                                analysis_goal=self._analysis_goal(),
+                                schema_fields=self._output_fields(),
+                                rows=batch_rows,
+                                use_function_calling=(
+                                    self.preset.structured_mode != "prompt"
+                                ),
                             )
-                        else:
-                            payload = outcome.result or {}
-                            row_outputs[outcome.index] = payload.get("output")
-                            pt = int(payload.get("prompt_tokens", 0))
-                            ct = int(payload.get("completion_tokens", 0))
-                            prompt_total += pt
-                            completion_total += ct
-                            if not payload.get("from_cache"):
+                            resp = await client.chat_batch(
+                                system_prompt=sys_p,
+                                user_prompt=user_p,
+                                schema_fields=self._output_fields(),
+                                expected_n=len(indices),
+                            )
+                            items = resp.items or []
+                            if len(items) != len(indices):
+                                raise LLMError(
+                                    f"批量响应数量不匹配：期望 {len(indices)} 条，实际 {len(items)} 条"
+                                )
+                            return {
+                                "items": items,
+                                "indices": indices,
+                                "prompt_tokens": resp.prompt_tokens,
+                                "completion_tokens": resp.completion_tokens,
+                            }
+
+                        return _do
+
+                    if batch_size <= 1:
+                        # Classic per-row path.
+                        def _on_outcome_single(outcome: TaskOutcome) -> None:
+                            nonlocal completed, prompt_total, completion_total
+                            completed += 1
+                            if outcome.error:
+                                row_errors[outcome.index] = outcome.error
+                                cache.put_row(
+                                    run_id,
+                                    outcome.index,
+                                    input_hash=hash_row(rows[outcome.index]),
+                                    output=None,
+                                    error=outcome.error,
+                                    duration_ms=outcome.duration_ms,
+                                )
+                            else:
+                                payload = outcome.result or {}
+                                row_outputs[outcome.index] = payload.get("output")
+                                pt = int(payload.get("prompt_tokens", 0))
+                                ct = int(payload.get("completion_tokens", 0))
+                                prompt_total += pt
+                                completion_total += ct
                                 cache.put_row(
                                     run_id,
                                     outcome.index,
@@ -214,26 +274,73 @@ class AnalysisRunner:
                                     completion_tokens=ct,
                                     duration_ms=outcome.duration_ms,
                                 )
-                        if on_progress is not None:
-                            on_progress(
-                                RunProgress(
-                                    completed=completed,
-                                    total=len(rows),
-                                    last_index=outcome.index,
-                                    last_error=outcome.error,
-                                    last_duration_ms=outcome.duration_ms,
-                                    prompt_tokens_total=prompt_total,
-                                    completion_tokens_total=completion_total,
-                                )
-                            )
+                            _emit_progress(outcome.index, outcome.duration_ms, outcome.error)
 
-                    tasks = [(i, _build_task(i)) for i in range(len(rows))]
-                    await run_bounded(
-                        tasks,
-                        max_concurrency=self.preset.max_concurrency,
-                        on_progress=_on_progress,
-                        cancel_event=cancel_event,
+                        tasks = [(i, _build_single_task(i)) for grp in row_groups for i in grp]
+                    else:
+                        # Batch path — one task per batch group.
+                        def _on_outcome_batch(outcome: TaskOutcome) -> None:
+                            nonlocal completed, prompt_total, completion_total
+                            # `outcome.index` is the position in row_groups, not a row index
+                            grp = row_groups[outcome.index]
+                            if outcome.error:
+                                # Batch-level failure: mark every row in the batch
+                                for i in grp:
+                                    row_errors[i] = f"批量失败：{outcome.error}"
+                                    cache.put_row(
+                                        run_id, i,
+                                        input_hash=hash_row(rows[i]),
+                                        output=None,
+                                        error=row_errors[i],
+                                        duration_ms=outcome.duration_ms,
+                                    )
+                                completed += len(grp)
+                                _emit_progress(grp[-1] if grp else -1, outcome.duration_ms, outcome.error)
+                                return
+                            payload = outcome.result or {}
+                            items = payload.get("items") or []
+                            pt = int(payload.get("prompt_tokens", 0))
+                            ct = int(payload.get("completion_tokens", 0))
+                            prompt_total += pt
+                            completion_total += ct
+                            per_row_dur = max(1, outcome.duration_ms // max(1, len(grp)))
+                            for i, item in zip(grp, items):
+                                row_outputs[i] = item if isinstance(item, dict) else None
+                                cache.put_row(
+                                    run_id, i,
+                                    input_hash=hash_row(rows[i]),
+                                    output=row_outputs[i],
+                                    error=None,
+                                    prompt_tokens=0,  # split: only batch totals make sense
+                                    completion_tokens=0,
+                                    duration_ms=per_row_dur,
+                                )
+                            completed += len(grp)
+                            _emit_progress(grp[-1] if grp else -1, outcome.duration_ms, None)
+
+                        tasks = [(g_idx, _build_batch_task(grp)) for g_idx, grp in enumerate(row_groups)]
+
+                    if batch_size <= 1:
+                        await run_bounded(
+                            tasks,
+                            max_concurrency=self.preset.max_concurrency,
+                            on_progress=_on_outcome_single,
+                            cancel_event=cancel_event,
+                        )
+                    else:
+                        await run_bounded(
+                            tasks,
+                            max_concurrency=self.preset.max_concurrency,
+                            on_progress=_on_outcome_batch,
+                            cancel_event=cancel_event,
+                        )
+
+                    # Account for cached rows that were skipped before the run started
+                    cached_count = sum(1 for o in row_outputs if o is not None) - sum(
+                        len(g) for g in row_groups if all(row_outputs[i] is not None for i in g)
                     )
+                    # (cached_count math kept simple: progress counts only items we actually ran.)
+                    # The completed counter already reflects what ran, which is fine for ETA.
 
                     if cancel_event is not None and cancel_event.is_set():
                         cancelled = True

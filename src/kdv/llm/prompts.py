@@ -39,6 +39,46 @@ def build_row_prompt(
     return system_prompt, user_prompt
 
 
+def build_batch_prompt(
+    *,
+    system_extra: str,
+    analysis_goal: str,
+    schema_fields: list[FieldSpec],
+    rows: list[dict[str, Any]],
+    use_function_calling: bool,
+) -> tuple[str, str]:
+    """Build a single prompt for analysing N rows in one LLM call.
+
+    The model is instructed to return an array of N objects, one per input row,
+    in the same order. The schema description is sent ONCE per batch instead of
+    once per row — that's where the token saving comes from.
+    """
+    schema_desc = schema_describe_for_prompt(schema_fields)
+    parts = [system_extra.strip(), "\n输出字段定义（每条数据要按此结构输出）：\n" + schema_desc]
+    if not use_function_calling:
+        parts.append(
+            "严格要求：输出一个 JSON 数组，元素数量必须严格等于输入数据的条数，"
+            "顺序与输入一一对应。每个元素是一个对象，键为上述字段名。"
+            "不要输出任何额外文本、注释或 Markdown 围栏。"
+        )
+    else:
+        parts.append(
+            "请通过 emit_batch 工具输出一个 results 数组，长度严格等于输入条数，顺序对齐。"
+        )
+    if analysis_goal:
+        parts.append(f"\n本次分析目标：{analysis_goal}")
+    system_prompt = "\n".join(p for p in parts if p)
+
+    user_lines = [f"共 {len(rows)} 条数据：\n"]
+    for i, r in enumerate(rows):
+        user_lines.append(f"--- 数据 #{i + 1} ---")
+        for k, v in r.items():
+            user_lines.append(f"  {k}: {_format_value(v)}")
+        user_lines.append("")
+    user_prompt = "\n".join(user_lines)
+    return system_prompt, user_prompt
+
+
 def build_summary_prompt(
     *,
     system_extra: str,

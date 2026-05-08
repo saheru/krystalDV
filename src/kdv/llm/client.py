@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import ssl
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -11,7 +12,7 @@ import httpx
 
 from kdv.config.models import LLMPreset
 from kdv.llm.retry import RetryableLLMError, retry_async
-from kdv.llm.schema import FieldSpec, build_tool_spec
+from kdv.llm.schema import FieldSpec, build_batch_tool_spec, build_tool_spec
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,16 @@ class LLMResponse:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class BatchResponse:
+    items: list[dict[str, Any]]
+    text: str
+    raw: dict[str, Any] = field(default_factory=dict)
+    used_function_calling: bool = False
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 class LLMClient:
@@ -156,8 +167,14 @@ class LLMClient:
 
         try:
             r = await self._http.post("/chat/completions", json=body)
-        except (httpx.TimeoutException, httpx.NetworkError) as e:
-            raise RetryableLLMError(f"网络/超时：{e}") from e
+        except httpx.TimeoutException as e:
+            raise RetryableLLMError(f"超时：{e}") from e
+        except (httpx.NetworkError, httpx.RemoteProtocolError) as e:
+            raise RetryableLLMError(f"网络错误：{type(e).__name__}: {e}") from e
+        except ssl.SSLError as e:
+            raise RetryableLLMError(f"SSL 错误：{e}") from e
+        except OSError as e:
+            raise RetryableLLMError(f"系统/连接错误：{e}") from e
 
         if r.status_code in (408, 425, 429) or 500 <= r.status_code < 600:
             raise RetryableLLMError(f"HTTP {r.status_code}: {r.text[:200]}")
@@ -205,6 +222,151 @@ class LLMClient:
                 f"响应不是 JSON（HTTP {r.status_code}）: {raw!r}{hint}"
             ) from e
         return _parse_chat_response(data, expect_tool=use_fc)
+
+    async def chat_batch(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        schema_fields: list[FieldSpec],
+        expected_n: int,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> "BatchResponse":
+        """One LLM call returning N structured rows. Falls back to prompt mode
+        if the proxy can't handle tools (same `_tools_unsupported` flag as `chat`).
+
+        Returns BatchResponse with `items` list (length should equal expected_n,
+        but caller must validate). On parsing failure, raises LLMError.
+        """
+
+        async def _call() -> "BatchResponse":
+            return await self._chat_batch_once(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                schema_fields=schema_fields,
+                expected_n=expected_n,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+        return await retry_async(_call, max_attempts=self.preset.max_retries)
+
+    async def _chat_batch_once(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        schema_fields: list[FieldSpec],
+        expected_n: int,
+        temperature: float | None,
+        max_tokens: int | None,
+    ) -> "BatchResponse":
+        if self._http is None:
+            raise LLMError("LLMClient 未进入 async context")
+
+        body: dict[str, Any] = {
+            "model": self.preset.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": self.preset.temperature if temperature is None else temperature,
+            "max_tokens": self.preset.max_tokens if max_tokens is None else max_tokens,
+            "stream": False,
+        }
+        mode = self.preset.structured_mode
+        use_fc = (not self._tools_unsupported) and mode in ("auto", "function_calling")
+        if use_fc:
+            body["tools"] = [build_batch_tool_spec(schema_fields, "emit_batch")]
+            body["tool_choice"] = {"type": "function", "function": {"name": "emit_batch"}}
+
+        try:
+            r = await self._http.post("/chat/completions", json=body)
+        except httpx.TimeoutException as e:
+            raise RetryableLLMError(f"超时：{e}") from e
+        except (httpx.NetworkError, httpx.RemoteProtocolError) as e:
+            raise RetryableLLMError(f"网络错误：{type(e).__name__}: {e}") from e
+        except ssl.SSLError as e:
+            raise RetryableLLMError(f"SSL 错误：{e}") from e
+        except OSError as e:
+            raise RetryableLLMError(f"系统/连接错误：{e}") from e
+
+        if r.status_code in (408, 425, 429) or 500 <= r.status_code < 600:
+            raise RetryableLLMError(f"HTTP {r.status_code}: {r.text[:200]}")
+        if r.status_code == 401 or r.status_code == 403:
+            raise LLMError(f"鉴权失败（HTTP {r.status_code}）。")
+        if r.status_code >= 400:
+            txt = r.text[:500]
+            if use_fc and ("tool" in txt.lower() or "function" in txt.lower()) and mode == "auto":
+                self._tools_unsupported = True
+                # Re-call without tools — easier to just recurse
+                return await self._chat_batch_once(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    schema_fields=schema_fields,
+                    expected_n=expected_n,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            raise LLMError(f"HTTP {r.status_code}: {txt}")
+
+        try:
+            data = r.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            raw = (r.text or "").strip()[:300] or "<empty body>"
+            empty = (raw == "<empty body>")
+            if empty and use_fc and mode == "auto":
+                self._tools_unsupported = True
+                return await self._chat_batch_once(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    schema_fields=schema_fields,
+                    expected_n=expected_n,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            raise RetryableLLMError(f"响应不是 JSON（HTTP {r.status_code}）: {raw!r}") from e
+
+        # Parse the response and pull out the items array
+        try:
+            choice = data["choices"][0]
+        except (KeyError, IndexError) as e:
+            raise LLMError(f"响应缺少 choices：{data}") from e
+        message = choice.get("message") or {}
+        usage = data.get("usage") or {}
+        items: list[dict[str, Any]] | None = None
+        used_fc = False
+        text = message.get("content") or ""
+
+        if use_fc:
+            tcs = message.get("tool_calls") or []
+            if tcs:
+                try:
+                    args = tcs[0]["function"]["arguments"]
+                    parsed = json.loads(args) if isinstance(args, str) else args
+                    if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
+                        items = parsed["results"]
+                        used_fc = True
+                except Exception:
+                    logger.exception("failed to parse batch tool args")
+
+        if items is None and text:
+            items = _extract_json_array_from_text(text)
+
+        if items is None:
+            raise LLMError(
+                f"批量响应未能解析为数组。原始回复前 200 字：{(text or '<空>')[:200]}"
+            )
+
+        return BatchResponse(
+            items=items,
+            text=text,
+            raw=data,
+            used_function_calling=used_fc,
+            prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+            completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+        )
 
     async def chat_with_tools(
         self,
@@ -254,8 +416,14 @@ class LLMClient:
         }
         try:
             r = await self._http.post("/chat/completions", json=body)
-        except (httpx.TimeoutException, httpx.NetworkError) as e:
-            raise RetryableLLMError(f"网络/超时：{e}") from e
+        except httpx.TimeoutException as e:
+            raise RetryableLLMError(f"超时：{e}") from e
+        except (httpx.NetworkError, httpx.RemoteProtocolError) as e:
+            raise RetryableLLMError(f"网络错误：{type(e).__name__}: {e}") from e
+        except ssl.SSLError as e:
+            raise RetryableLLMError(f"SSL 错误：{e}") from e
+        except OSError as e:
+            raise RetryableLLMError(f"系统/连接错误：{e}") from e
 
         if r.status_code in (408, 425, 429) or 500 <= r.status_code < 600:
             raise RetryableLLMError(f"HTTP {r.status_code}: {r.text[:200]}")
@@ -304,8 +472,14 @@ class LLMClient:
         }
         try:
             r = await self._http.post("/chat/completions", json=body)
-        except (httpx.TimeoutException, httpx.NetworkError) as e:
-            raise RetryableLLMError(f"网络/超时：{e}") from e
+        except httpx.TimeoutException as e:
+            raise RetryableLLMError(f"超时：{e}") from e
+        except (httpx.NetworkError, httpx.RemoteProtocolError) as e:
+            raise RetryableLLMError(f"网络错误：{type(e).__name__}: {e}") from e
+        except ssl.SSLError as e:
+            raise RetryableLLMError(f"SSL 错误：{e}") from e
+        except OSError as e:
+            raise RetryableLLMError(f"系统/连接错误：{e}") from e
         if r.status_code in (408, 425, 429) or 500 <= r.status_code < 600:
             raise RetryableLLMError(f"HTTP {r.status_code}: {r.text[:200]}")
         if r.status_code >= 400:
@@ -322,6 +496,33 @@ class LLMClient:
 
 _FENCED_JSON = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL | re.IGNORECASE)
 _RAW_JSON_OBJ = re.compile(r"(\{(?:[^{}]|(?:\{[^{}]*\}))*\})", re.DOTALL)
+_RAW_JSON_ARR = re.compile(r"(\[[\s\S]*\])", re.DOTALL)
+
+
+def _extract_json_array_from_text(text: str) -> list[dict[str, Any]] | None:
+    """Extract a JSON array of objects from raw text (for batch responses)."""
+    if not text:
+        return None
+    candidates: list[str] = []
+    m = _FENCED_JSON.search(text)
+    if m:
+        candidates.append(m.group(1))
+    candidates.append(text.strip())
+    m = _RAW_JSON_ARR.search(text)
+    if m:
+        candidates.append(m.group(1))
+    for c in candidates:
+        try:
+            obj = json.loads(c)
+        except Exception:
+            continue
+        if isinstance(obj, list) and all(isinstance(x, dict) for x in obj):
+            return obj
+        if isinstance(obj, dict) and isinstance(obj.get("results"), list):
+            results = obj["results"]
+            if all(isinstance(x, dict) for x in results):
+                return results
+    return None
 
 
 def _parse_chat_response(data: dict[str, Any], *, expect_tool: bool) -> LLMResponse:
