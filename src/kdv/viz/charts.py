@@ -276,18 +276,32 @@ def make_box(values: list[Any], *, color_idx: int = 0) -> QWidget:
 
     p = _new_plot()
     color = _color(color_idx)
-    box = pg.BarGraphItem(x=[1], y0=[q1], height=[q3 - q1], width=0.4, brush=color, pen=color)
+    # Box body: bar from q1 to q3 (BarGraphItem uses y0 + height).
+    box = pg.BarGraphItem(
+        x=[1], y0=[q1], height=[q3 - q1], width=0.5,
+        brush=color, pen=pg.mkPen(color),
+    )
     p.addItem(box)
-    p.plot([1], [med], pen=None, symbol="-", symbolSize=30, symbolPen=pg.mkPen(FG, width=2))
-    # whiskers
-    p.plot([1, 1], [lo, q1], pen=pg.mkPen(FG, width=1))
-    p.plot([1, 1], [q3, hi], pen=pg.mkPen(FG, width=1))
-    # outliers
+    # Median: thick horizontal line across the box width.
+    half_w = 0.25
+    p.plot([1 - half_w, 1 + half_w], [med, med], pen=pg.mkPen(FG, width=2.5))
+    # Whiskers (vertical lines top/bottom of the box).
+    p.plot([1, 1], [lo, q1], pen=pg.mkPen(FG, width=1.2))
+    p.plot([1, 1], [q3, hi], pen=pg.mkPen(FG, width=1.2))
+    # Whisker caps.
+    cap_w = 0.12
+    p.plot([1 - cap_w, 1 + cap_w], [lo, lo], pen=pg.mkPen(FG, width=1.2))
+    p.plot([1 - cap_w, 1 + cap_w], [hi, hi], pen=pg.mkPen(FG, width=1.2))
+    # Outliers as red dots.
     out = arr[(arr < lo) | (arr > hi)]
     if len(out):
-        p.plot([1] * len(out), out.tolist(), pen=None, symbol="o", symbolSize=5,
-               symbolBrush="#EF4444", symbolPen="#EF4444")
+        scatter = pg.ScatterPlotItem(
+            [1] * len(out), out.tolist(),
+            pen=pg.mkPen("#EF4444"), brush="#EF4444", size=6, symbol="o",
+        )
+        p.addItem(scatter)
     p.getAxis("bottom").setTicks([[(1, "")]])
+    p.setXRange(0.4, 1.6)
     return p
 
 
