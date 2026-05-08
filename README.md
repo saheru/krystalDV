@@ -80,22 +80,6 @@ pytest
 | --- | --- | --- |
 | `build-windows.yml` | push 到 main / 打 `v*` tag / 手动触发 | `kdv-windows.zip` |
 | `build-mac.yml` | push 到 main / 打 `v*` tag / 手动触发 | `kdv-mac.zip` (Apple Silicon) |
-| `claude-review.yml` | 每个 PR | Claude 自动评审 + 评论 |
-| `claude.yml` | 评论 / issue 里 `@claude` | Claude 答问题 / 改代码 |
-| `claude-test-triage.yml` | 构建失败时 | Claude 分析日志 + 给出修复建议 |
-
-### Claude 自动 review / 修复（可选）
-
-要启用 `claude-*.yml` 三个工作流，给仓库加一个 secret：
-
-1. GitHub repo → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
-2. Name = `ANTHROPIC_API_KEY`，Value = 你在 [console.anthropic.com](https://console.anthropic.com) 创建的 API key
-3. 之后：
-   - 提 PR 时 Claude 会自动评审改动并发评论
-   - 在 PR/issue 评论里 `@claude 帮我把 X 改成 Y` 它就会动手改并提交
-   - CI 构建失败时 Claude 会自动分析失败日志并发评论给出修复建议
-
-按 token 计费；想省钱把 workflow 里的 `model: claude-opus-4-7` 换成 `claude-haiku-4-5-20251001`。
 
 每次 push 后到 GitHub 仓库的 **Actions 标签页**，点对应 workflow 的最新一次运行 → 滚到底部 **Artifacts** 区下载 zip。打 `v*` 标签（如 `git tag v0.1.0 && git push --tags`）会自动创建带 zip 附件的 GitHub Release。
 
