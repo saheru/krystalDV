@@ -151,13 +151,7 @@ class LLMClient:
             if use_fc and ("tool" in txt.lower() or "function" in txt.lower()):
                 if mode == "auto":
                     logger.info("provider rejected tools; falling back to prompt mode")
-                    return await self._chat_once(
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        schema_fields=schema_fields,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    ) if False else await self._chat_prompt_fallback(
+                    return await self._chat_prompt_fallback(
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
                         schema_fields=schema_fields,
@@ -166,7 +160,17 @@ class LLMClient:
                     )
             raise LLMError(f"HTTP {r.status_code}: {txt}")
 
-        data = r.json()
+        try:
+            data = r.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            raw = (r.text or "").strip()[:300] or "<empty body>"
+            # Empty / non-JSON response from the provider — most often a
+            # transient proxy hiccup. Treat as retryable so the wrapper
+            # backs off and tries again instead of dumping the raw
+            # JSONDecodeError into the per-row error column.
+            raise RetryableLLMError(
+                f"响应不是 JSON（HTTP {r.status_code}）: {raw!r}"
+            ) from e
         return _parse_chat_response(data, expect_tool=use_fc)
 
     async def chat_with_tools(
@@ -225,7 +229,14 @@ class LLMClient:
             raise LLMError(f"鉴权失败（HTTP {r.status_code}）。")
         if r.status_code >= 400:
             raise LLMError(f"HTTP {r.status_code}: {r.text[:500]}")
-        return _parse_chat_response(r.json(), expect_tool=True)
+        try:
+            data = r.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            raw = (r.text or "").strip()[:300] or "<empty body>"
+            raise RetryableLLMError(
+                f"响应不是 JSON（HTTP {r.status_code}）: {raw!r}"
+            ) from e
+        return _parse_chat_response(data, expect_tool=True)
 
     async def _chat_prompt_fallback(
         self,
@@ -257,7 +268,14 @@ class LLMClient:
             raise RetryableLLMError(f"HTTP {r.status_code}: {r.text[:200]}")
         if r.status_code >= 400:
             raise LLMError(f"HTTP {r.status_code}: {r.text[:500]}")
-        return _parse_chat_response(r.json(), expect_tool=False)
+        try:
+            data = r.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            raw = (r.text or "").strip()[:300] or "<empty body>"
+            raise RetryableLLMError(
+                f"响应不是 JSON（HTTP {r.status_code}）: {raw!r}"
+            ) from e
+        return _parse_chat_response(data, expect_tool=False)
 
 
 _FENCED_JSON = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL | re.IGNORECASE)

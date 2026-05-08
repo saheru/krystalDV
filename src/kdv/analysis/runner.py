@@ -167,7 +167,12 @@ class AnalysisRunner:
                                 schema_fields=self._output_fields(),
                             )
                             if resp.parsed is None:
-                                raise LLMError("LLM 未返回可解析的结构化结果")
+                                # Surface the actual model output (often empty / a refusal)
+                                # so the user can see what went wrong.
+                                snippet = (resp.text or "")[:200] or "<空>"
+                                raise LLMError(
+                                    f"LLM 未返回可解析的结构化结果。原始回复：{snippet}"
+                                )
                             return {
                                 "output": resp.parsed,
                                 "prompt_tokens": resp.prompt_tokens,
