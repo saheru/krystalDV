@@ -499,6 +499,17 @@ class RunPage(QWidget):
         mode = self._selected_mode()
         if model is None and mode != "summary":
             mode = "summary"
+
+        # CRITICAL — clear any previous run's state before this one starts so
+        # the result page can never show a stale mix of run #N-1 + run #N.
+        self.state.last_run = None
+        self.state.extra.pop("agent_charts", None)
+        self.state.extra.pop("agent_insights", None)
+        try:
+            self.run_completed.emit(None)
+        except Exception:
+            pass
+
         total = len(self._data.rows)
         self.progress.setRange(0, max(1, total))
         self.progress.setValue(0)

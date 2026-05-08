@@ -34,9 +34,7 @@ from kdv.agent.session import AgentSession, SessionTurnResult
 from kdv.agent.tools import ChartSpec, Insight
 from kdv.agent.trace import TraceEvent
 from kdv.analysis.runner import RunResult
-from kdv.export.payload import ChartImage, ExportPayload, capture_widget_png
-from kdv.export.docx_export import export_docx
-from kdv.export.pptx_export import export_pptx
+from kdv.export.payload import ChartImage, ExportPayload, capture_widget_png  # noqa: F401
 from kdv.ui import helpers as h
 from kdv.ui import style
 from kdv.ui.animations import count_up_label, reveal_height, stagger_reveal
@@ -60,6 +58,7 @@ class ResultPage(QWidget):
         # (title, rationale, body_widget) for exporting
         self._chart_records: list[tuple[str, str, QWidget]] = []
         self._current_result: RunResult | None = None
+        self._floating_chat: QWidget | None = None
         self._build_empty()
 
     # ---- empty placeholder ----------------------------------------------
@@ -99,80 +98,95 @@ class ResultPage(QWidget):
                     self._delete_layout(child)
 
     # ---- main entry ------------------------------------------------------
-    def render_result(self, result: RunResult) -> None:
+    def render_result(self, result: RunResult | None) -> None:
+        # Hard reset state so prior runs don't bleed into this one.
         self._clear_layout()
         self._dynamic_charts = []
         self._dynamic_insights = []
         self._auto_chart_count = 0
         self._chart_records = []
         self._current_result = result
+        self._session = None
+        # Tear down any visible floating chat — it was bound to the prior dataset.
+        if hasattr(self, "_floating_chat") and self._floating_chat is not None:
+            try:
+                self._floating_chat.deleteLater()
+            except Exception:
+                pass
+            self._floating_chat = None
+        if result is None:
+            # Run cleared (a new run is starting) — show neutral placeholder.
+            self._build_empty()
+            return
+        # Prevent stale agent artefacts from previous renders polluting this view.
+        agent_charts = self.state.extra.pop("agent_charts", None) or []
+        agent_insights = self.state.extra.pop("agent_insights", None) or []
+        if hasattr(self, "_floating_chat") and self._floating_chat is not None:
+            try:
+                self._floating_chat.deleteLater()
+            except Exception:
+                pass
+            self._floating_chat = None
+
+        # ---- whole page in one scroll area ------------------------------
+        from PySide6.QtWidgets import QScrollArea as _SA
+
+        scroll = _SA()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(_SA.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        page = QWidget()
+        page.setObjectName("page")
+        page_lay = QVBoxLayout(page)
+        page_lay.setContentsMargins(28, 24, 28, 32)
+        page_lay.setSpacing(20)
+        scroll.setWidget(page)
+        self._main.addWidget(scroll, 1)
+        self._page_lay = page_lay  # for floating-chat reparenting reference
 
         head = QHBoxLayout()
         head.addWidget(h.heading("分析结果", level=1))
         head.addStretch(1)
-        export_word_btn = h.ghost_button("📄 导出 Word")
-        export_word_btn.clicked.connect(self._on_export_word)
-        export_ppt_btn = h.ghost_button("📊 导出 PPT")
-        export_ppt_btn.clicked.connect(self._on_export_ppt)
-        head.addWidget(export_word_btn)
-        head.addWidget(export_ppt_btn)
+        export_btn = h.primary_button("📤 导出报告")
+        export_btn.clicked.connect(self._on_open_export_dialog)
+        chat_toggle_btn = h.ghost_button("💬 对话分析")
+        chat_toggle_btn.setToolTip("打开/关闭浮动对话框")
+        chat_toggle_btn.clicked.connect(self._toggle_floating_chat)
+        head.addWidget(chat_toggle_btn)
+        head.addWidget(export_btn)
         head.addWidget(h.muted(f"运行 ID: {result.run_id}"))
-        self._main.addLayout(head)
+        page_lay.addLayout(head)
 
-        self._main.addWidget(self._build_kpis(result))
+        page_lay.addWidget(self._build_kpis(result))
 
-        # Main split: charts (left) + insights+chat (right)
-        split = QSplitter(Qt.Horizontal)
-        split.setChildrenCollapsible(False)
-        split.setHandleWidth(10)
+        # ---- 整表汇总洞察 (full width card) -----------------------------
+        insights_card = self._build_insights_panel(result)
+        page_lay.addWidget(insights_card)
 
-        # ---- left: chart grid (scrollable) ------------------------------
-        left_scroll = QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setFrameShape(QScrollArea.NoFrame)
-        self._left_inner = QWidget()
-        grid_root = QVBoxLayout(self._left_inner)
-        grid_root.setContentsMargins(0, 0, 0, 0)
-        grid_root.setSpacing(12)
-
-        self._charts_header = QHBoxLayout()
-        self._charts_header.addWidget(h.heading("图表网格", level=3))
-        self._charts_header.addStretch(1)
-        grid_root.addLayout(self._charts_header)
-
+        # ---- 图表网格 (full width, vertical stack of cards) ------------
+        charts_section = h.make_card(padding=16)
+        charts_section.layout().addWidget(h.heading("分析图表", level=2))
         self._chart_grid = QGridLayout()
         self._chart_grid.setContentsMargins(0, 0, 0, 0)
-        self._chart_grid.setSpacing(16)
-        grid_root.addLayout(self._chart_grid)
-        grid_root.addStretch(1)
+        self._chart_grid.setHorizontalSpacing(16)
+        self._chart_grid.setVerticalSpacing(16)
+        charts_section.layout().addLayout(self._chart_grid)
+        page_lay.addWidget(charts_section)
 
-        left_scroll.setWidget(self._left_inner)
-        split.addWidget(left_scroll)
-
-        # ---- right: tabs (insights / chat) ------------------------------
-        right_tabs = QTabWidget()
-        right_tabs.addTab(self._build_insights_panel(result), "📋 洞察")
-        right_tabs.addTab(self._build_chat_panel(result), "💬 对话分析")
-        right_tabs.setCurrentIndex(1)  # chat tab opens by default — primary interaction
-        split.addWidget(right_tabs)
-        split.setSizes([900, 540])
-
-        self._main.addWidget(split, 1)
-
-        # ---- bottom: raw data + errors ---------------------------------
-        tabs = QTabWidget()
-        tabs.setMinimumHeight(260)
-        tabs.addTab(self._build_data_table(result), "原始数据 + 输出")
-        tabs.addTab(self._build_error_table(result), f"错误（{sum(1 for e in result.row_errors if e)}）")
-        self._main.addWidget(tabs)
+        # ---- bottom: raw data + errors (still tabs, full width) -------
+        bot_tabs = QTabWidget()
+        bot_tabs.setMinimumHeight(280)
+        bot_tabs.addTab(self._build_data_table(result), "原始数据 + 输出")
+        bot_tabs.addTab(
+            self._build_error_table(result),
+            f"错误（{sum(1 for e in result.row_errors if e)}）",
+        )
+        page_lay.addWidget(bot_tabs)
 
         # Populate auto-recommended charts
         self._populate_auto_charts(result)
 
-        # If this is an agent-completed result, also inject the agent's
-        # pre-built charts/insights so the user sees them straight away.
-        agent_charts = self.state.extra.pop("agent_charts", None) or []
-        agent_insights = self.state.extra.pop("agent_insights", None) or []
+        # Inject agent-completed artefacts (popped above so don't pollute next run)
         for spec in agent_charts:
             widget = self._build_chart_from_spec(spec)
             if widget is None:
@@ -182,7 +196,7 @@ class ResultPage(QWidget):
         for ins in agent_insights:
             self._append_dynamic_insight(ins)
 
-        # Spin up agent session for live chat
+        # Spin up agent session for the floating chat
         preset = self.state.selected_preset()
         if preset and self.state.get_api_key(preset):
             self._session = AgentSession(
@@ -190,19 +204,6 @@ class ResultPage(QWidget):
                 api_key=self.state.get_api_key(preset),
                 columns=result.columns,
                 rows=result.rows,
-            )
-            self._append_chat_bubble(
-                "assistant",
-                "您好！我已经加载了这份数据。可以让我做对账分析、新增图表、按某列筛选再分析等等——"
-                "比如：\n\n"
-                "- *把销售额按地区做柱状图*\n"
-                "- *渠道商 A 这月对账单 12000、B 8500，做差异对比*\n"
-                "- *找出金额异常高的前 10 行*\n",
-            )
-        else:
-            self._append_chat_bubble(
-                "assistant",
-                "_未检测到可用的 LLM 配置，对话分析已禁用。请到『LLM 配置』页填写 API key。_",
             )
 
     # ---- KPIs -----------------------------------------------------------
@@ -362,50 +363,152 @@ class ResultPage(QWidget):
             cur = _INSIGHT_CSS
         self._insights_browser.setHtml(cur + title_html + body_html)
 
-    # ---- chat -----------------------------------------------------------
-    def _build_chat_panel(self, result: RunResult) -> QWidget:
-        card = h.make_card(padding=12)
-        card.layout().addWidget(h.heading("对话分析", level=3))
-        card.layout().addWidget(
-            h.muted("和数据对话：让我新增图表、做对账比对、按条件筛选再分析等。")
+    # ---- floating chat --------------------------------------------------
+    def _toggle_floating_chat(self) -> None:
+        if getattr(self, "_floating_chat", None) is None:
+            self._floating_chat = self._build_floating_chat()
+        if self._floating_chat.isVisible():
+            self._floating_chat.hide()
+        else:
+            self._position_floating_chat()
+            self._floating_chat.show()
+            self._floating_chat.raise_()
+
+    def _position_floating_chat(self) -> None:
+        """Place the floating chat at the bottom-right of the result page."""
+        if self._floating_chat is None:
+            return
+        parent = self.window() or self
+        margin = 20
+        w = 420
+        hgt = 520
+        try:
+            geo = parent.geometry()
+            x = geo.x() + geo.width() - w - margin
+            y = geo.y() + geo.height() - hgt - margin
+            self._floating_chat.setGeometry(x, y, w, hgt)
+        except Exception:
+            self._floating_chat.resize(w, hgt)
+
+    def _build_floating_chat(self) -> QWidget:
+        from PySide6.QtCore import QPoint
+        from PySide6.QtWidgets import QFrame as _QF
+
+        win = _QF(self.window())
+        win.setObjectName("floatingChat")
+        win.setWindowFlags(
+            Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+        )
+        win.setAttribute(Qt.WA_TranslucentBackground, False)
+        win.setStyleSheet(
+            "#floatingChat {"
+            f"  background: {style.BG_CARD};"
+            f"  border: 1px solid {style.BORDER_STRONG};"
+            "  border-radius: 14px;"
+            "}"
         )
 
-        # message list (scrollable)
-        scroll = QScrollArea()
+        outer = QVBoxLayout(win)
+        outer.setContentsMargins(14, 12, 14, 14)
+        outer.setSpacing(10)
+
+        # Drag handle row
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        title = QLabel("💬 对话分析")
+        title.setStyleSheet(
+            "font-size: 14px; font-weight: 700; background: transparent; border: none;"
+        )
+        head.addWidget(title)
+        head.addStretch(1)
+        close_btn = QLabel("✕")
+        close_btn.setStyleSheet(
+            f"color: {style.TEXT_MUTED}; font-size: 14px; padding: 2px 6px;"
+            f"background: transparent; border: none;"
+        )
+        close_btn.setCursor(Qt.PointingHandCursor)
+
+        def _close(_event):
+            win.hide()
+        close_btn.mousePressEvent = _close  # type: ignore[assignment]
+        head.addWidget(close_btn)
+        outer.addLayout(head)
+
+        # Sub-text
+        sub = h.muted(
+            "和数据对话：新增图表 / 对账 / 筛选 / 计算……图表洞察会实时贴到主页面。"
+        )
+        sub.setWordWrap(True)
+        outer.addWidget(sub)
+
+        # Message list scroll
+        scroll = QScrollArea(win)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
         scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
-        msgs_inner = QWidget()
-        self._chat_messages_lay = QVBoxLayout(msgs_inner)
+        inner = QWidget()
+        self._chat_messages_lay = QVBoxLayout(inner)
         self._chat_messages_lay.setContentsMargins(0, 0, 0, 0)
-        self._chat_messages_lay.setSpacing(10)
+        self._chat_messages_lay.setSpacing(8)
         self._chat_messages_lay.addStretch(1)
-        scroll.setWidget(msgs_inner)
+        scroll.setWidget(inner)
         self._chat_scroll = scroll
-        card.layout().addWidget(scroll, 1)
+        outer.addWidget(scroll, 1)
 
-        # input box
+        # Input row
         input_row = QHBoxLayout()
         self._chat_input = QPlainTextEdit()
-        self._chat_input.setPlaceholderText(
-            "提问或要求…  (Cmd/Ctrl+Enter 发送)"
-        )
-        self._chat_input.setFixedHeight(72)
+        self._chat_input.setPlaceholderText("提问或要求…  (Cmd/Ctrl+Enter 发送)")
+        self._chat_input.setMinimumHeight(60)
+        self._chat_input.setMaximumHeight(96)
         self._chat_input.installEventFilter(self)
         input_row.addWidget(self._chat_input, 1)
 
         send_col = QVBoxLayout()
+        send_col.setSpacing(4)
         self._send_btn = h.primary_button("发送")
+        self._send_btn.setMinimumHeight(28)
         self._send_btn.clicked.connect(self._on_send)
         self._cancel_btn = h.danger_button("取消")
+        self._cancel_btn.setMinimumHeight(28)
         self._cancel_btn.setEnabled(False)
         self._cancel_btn.clicked.connect(self._on_cancel)
         send_col.addWidget(self._send_btn)
         send_col.addWidget(self._cancel_btn)
         input_row.addLayout(send_col)
+        outer.addLayout(input_row)
 
-        card.layout().addLayout(input_row)
-        return card
+        # Make the title bar draggable
+        self._chat_drag_offset = QPoint()
+
+        def _press(event):
+            if event.button() == Qt.LeftButton:
+                self._chat_drag_offset = event.globalPosition().toPoint() - win.frameGeometry().topLeft()
+                event.accept()
+        def _move(event):
+            if event.buttons() & Qt.LeftButton:
+                win.move(event.globalPosition().toPoint() - self._chat_drag_offset)
+                event.accept()
+        title.mousePressEvent = _press  # type: ignore[assignment]
+        title.mouseMoveEvent = _move    # type: ignore[assignment]
+        title.setCursor(Qt.SizeAllCursor)
+
+        # Greeting
+        if self._session is not None:
+            self._append_chat_bubble(
+                "assistant",
+                "您好！这份数据已加载。可以让我新增图表、做对账、筛选再分析——"
+                "图表和洞察会**实时贴到主页面**：\n\n"
+                "- *把销售额按地区做柱状图*\n"
+                "- *渠道 A 12000 / B 8500，做差异对比*\n"
+                "- *找出金额最高的前 10 行*",
+            )
+        else:
+            self._append_chat_bubble(
+                "assistant",
+                "_未检测到可用的 LLM 配置，对话分析已禁用。请到『LLM 配置』页填写 API key。_",
+            )
+        return win
 
     def eventFilter(self, obj, event):
         from PySide6.QtCore import QEvent
@@ -613,112 +716,64 @@ class ResultPage(QWidget):
         m = self.state.selected_model()
         return m.output_fields if m else []
 
-    # ---- export -----------------------------------------------------------
-    def _build_export_payload(self) -> ExportPayload:
+    # ---- export ---------------------------------------------------------
+    def _on_open_export_dialog(self) -> None:
+        if not self._chart_records:
+            h.toast(self.window(), "当前页面没有可导出的图表", "warning")
+            return
+        from kdv.ui.export_dialog import ExportReportDialog
+
         result = self._current_result
         preset = self.state.selected_preset()
-        model = self.state.selected_model()
-
-        kpis: list[tuple[str, str]] = []
-        if result:
-            total = len(result.rows)
-            tokens = result.prompt_tokens_total + result.completion_tokens_total
-            has_per_row = any(o is not None for o in result.row_outputs)
-            if has_per_row:
-                success = sum(1 for o, e in zip(result.row_outputs, result.row_errors) if o and not e)
-                fail = total - success
-                avg_ms = result.duration_ms_total // max(total, 1)
-                rate = (success / total * 100) if total else 0
-                kpis = [
-                    ("总行数", str(total)),
-                    ("成功", str(success)),
-                    ("失败", str(fail)),
-                    ("成功率", f"{rate:.1f}%"),
-                    ("平均耗时", f"{avg_ms} ms"),
-                    ("Token 用量", f"{tokens:,}"),
-                ]
-            else:
-                kpis = [
-                    ("数据行数", str(total)),
-                    ("数据列数", str(len(result.columns))),
-                    ("耗时", f"{result.duration_ms_total // 1000} s"),
-                    ("Prompt tokens", f"{result.prompt_tokens_total:,}"),
-                    ("Completion tokens", f"{result.completion_tokens_total:,}"),
-                    ("分析模式", result.mode),
-                ]
-
-        # Capture every chart widget to PNG
-        charts: list[ChartImage] = []
-        for title, rationale, body in self._chart_records:
-            try:
-                png = capture_widget_png(body, scale=2.0)
-            except Exception:
-                png = b""
-            charts.append(ChartImage(title=title, rationale=rationale, png_bytes=png))
-
-        # Insights from session
-        insights: list[tuple[str, str, str]] = []
-        if self._session:
-            for ins in self._session.all_insights:
-                insights.append((ins.title, ins.body, ins.severity))
-
-        sample_cols = list(result.columns) if result else []
-        sample_rows = list(result.rows[:8]) if result else []
-
-        return ExportPayload(
-            title="Krystal Data Vision 分析报告",
-            subtitle=(model.name if model else "无模型 · 直接整表汇总"),
-            preset_name=(preset.name if preset else ""),
-            model_id=(preset.model if preset else ""),
-            analysis_model_name=(model.name if model else "—"),
-            mode=(result.mode if result else ""),
+        api_key = self.state.get_api_key(preset) if preset else ""
+        kpis = self._collect_kpis_for_export(result)
+        meta = {
+            "subtitle": (self.state.selected_model().name if self.state.selected_model() else "无模型 · 整表汇总"),
+            "preset_name": preset.name if preset else "",
+            "model_id": preset.model if preset else "",
+            "analysis_model_name": self.state.selected_model().name if self.state.selected_model() else "—",
+            "mode": result.mode if result else "",
+        }
+        dlg = ExportReportDialog(
+            parent=self.window(),
+            chart_records=list(self._chart_records),
+            result_columns=list(result.columns) if result else [],
+            result_rows=list(result.rows[:30]) if result else [],
+            result_summary=(result.summary_markdown if result else "") or "",
             kpis=kpis,
-            summary_markdown=(result.summary_markdown if result else "") or "",
-            charts=charts,
-            sample_columns=sample_cols,
-            sample_rows=sample_rows,
-            insights=insights,
+            meta=meta,
+            preset=preset,
+            api_key=api_key,
         )
+        dlg.exec()
 
-    def _on_export_word(self) -> None:
-        from PySide6.QtWidgets import QFileDialog
-        from datetime import datetime as _dt
-
-        suggested = f"分析报告_{_dt.now().strftime('%Y%m%d_%H%M%S')}.docx"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "导出 Word", suggested, "Word 文档 (*.docx)"
-        )
-        if not path:
-            return
-        try:
-            payload = self._build_export_payload()
-            export_docx(payload, path)
-            h.toast(self.window(), f"已导出 Word：{path}", "success")
-        except Exception as e:  # noqa: BLE001
-            import logging
-
-            logging.exception("docx export failed")
-            h.toast(self.window(), f"Word 导出失败：{e}", "danger")
-
-    def _on_export_ppt(self) -> None:
-        from PySide6.QtWidgets import QFileDialog
-        from datetime import datetime as _dt
-
-        suggested = f"分析报告_{_dt.now().strftime('%Y%m%d_%H%M%S')}.pptx"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "导出 PPT", suggested, "PowerPoint 文档 (*.pptx)"
-        )
-        if not path:
-            return
-        try:
-            payload = self._build_export_payload()
-            export_pptx(payload, path)
-            h.toast(self.window(), f"已导出 PPT：{path}", "success")
-        except Exception as e:  # noqa: BLE001
-            import logging
-
-            logging.exception("pptx export failed")
-            h.toast(self.window(), f"PPT 导出失败：{e}", "danger")
+    def _collect_kpis_for_export(self, result: RunResult | None) -> list[tuple[str, str]]:
+        if result is None:
+            return []
+        total = len(result.rows)
+        has_per_row = any(o is not None for o in result.row_outputs)
+        tokens = result.prompt_tokens_total + result.completion_tokens_total
+        if has_per_row:
+            success = sum(1 for o, e in zip(result.row_outputs, result.row_errors) if o and not e)
+            fail = total - success
+            avg_ms = result.duration_ms_total // max(total, 1)
+            rate = (success / total * 100) if total else 0
+            return [
+                ("总行数", str(total)),
+                ("成功", str(success)),
+                ("失败", str(fail)),
+                ("成功率", f"{rate:.1f}%"),
+                ("平均耗时", f"{avg_ms} ms"),
+                ("Token 用量", f"{tokens:,}"),
+            ]
+        return [
+            ("数据行数", str(total)),
+            ("数据列数", str(len(result.columns))),
+            ("耗时", f"{result.duration_ms_total // 1000} s"),
+            ("Prompt tokens", f"{result.prompt_tokens_total:,}"),
+            ("Completion tokens", f"{result.completion_tokens_total:,}"),
+            ("分析模式", result.mode),
+        ]
 
 
 # ----------------------------------------------------------------------

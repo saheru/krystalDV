@@ -198,11 +198,14 @@ class MainWindow(QMainWindow):
             sc.activated.connect(lambda k=key: self._switch_to(k))
 
     def _on_run_completed(self, result) -> None:
-        # Always render so the result page is up-to-date; navigation is
-        # done via the clickable toast in `_notify_run_completed`.
+        # `None` = a new run just started, clear the result page so the user
+        # never sees a stale mix of prior + current data while run #N executes.
+        # Otherwise: render the fresh result.
         self.result_page.render_result(result)
 
     def _notify_run_completed(self, result) -> None:
+        if result is None:
+            return  # run just started; no completion toast yet
         n = len(getattr(result, "rows", []))
         h.toast(
             self,

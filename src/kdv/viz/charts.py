@@ -54,6 +54,45 @@ pg.setConfigOption("foreground", FG)
 pg.setConfigOption("antialias", True)
 
 
+# ----------------------------------------------------------------------
+# Configure matplotlib once for CJK rendering. Without this, Chinese
+# labels in pie / radar / heatmap / treemap show as boxes (□).
+# Try a list of likely CJK fonts; first match wins on each platform.
+def _configure_matplotlib_cjk_font() -> None:
+    try:
+        import matplotlib
+        from matplotlib import font_manager
+
+        candidates = [
+            "PingFang SC",       # macOS default Chinese
+            "Heiti SC",          # macOS fallback
+            "STHeiti",
+            "Hiragino Sans GB",  # macOS
+            "Microsoft YaHei",   # Windows
+            "Microsoft JhengHei",
+            "SimHei",            # Windows
+            "Source Han Sans CN",
+            "Noto Sans CJK SC",  # Linux
+            "WenQuanYi Zen Hei",
+            "Arial Unicode MS",
+        ]
+        installed = {f.name for f in font_manager.fontManager.ttflist}
+        chosen = next((c for c in candidates if c in installed), None)
+        if chosen is None:
+            return
+        # Put chosen font first; keep DejaVu Sans as numeric fallback.
+        matplotlib.rcParams["font.sans-serif"] = [chosen, "DejaVu Sans"]
+        matplotlib.rcParams["font.family"] = "sans-serif"
+        # Negative-sign rendering breaks when CJK font is the default.
+        matplotlib.rcParams["axes.unicode_minus"] = False
+    except Exception:
+        # Never let font config break charts entirely.
+        pass
+
+
+_configure_matplotlib_cjk_font()
+
+
 def _color(i: int) -> str:
     return PALETTE[i % len(PALETTE)]
 
