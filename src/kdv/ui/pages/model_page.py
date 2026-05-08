@@ -54,8 +54,11 @@ class ModelPage(QWidget):
         self._reload_list()
 
     def _build(self) -> None:
+        # Top-level layout: heading + intro + horizontal split.
+        # The right-side editor is heavy (basics + import + fields table) so
+        # we wrap it in its own QScrollArea — the left list stays fixed.
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 20, 24, 20)
+        root.setContentsMargins(28, 24, 28, 24)
         root.setSpacing(16)
 
         head = QHBoxLayout()
@@ -80,11 +83,22 @@ class ModelPage(QWidget):
         left.layout().addWidget(self.list)
         split.addWidget(left)
 
+        # Right-side scroll wrapper so a long editor can scroll, not crush
+        from PySide6.QtWidgets import QScrollArea
+
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QScrollArea.NoFrame)
+        right_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+        )
         self._right_holder = QWidget()
+        self._right_holder.setObjectName("page")
         self._right_holder_lay = QVBoxLayout(self._right_holder)
         self._right_holder_lay.setContentsMargins(0, 0, 0, 0)
-        self._right_holder_lay.setSpacing(16)
-        split.addWidget(self._right_holder)
+        self._right_holder_lay.setSpacing(20)
+        right_scroll.setWidget(self._right_holder)
+        split.addWidget(right_scroll)
         split.setSizes([300, 820])
         root.addWidget(split, 1)
 
@@ -201,17 +215,34 @@ class ModelPage(QWidget):
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignRight)
         form.setHorizontalSpacing(20)
+        form.setVerticalSpacing(14)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
         self.name_input = QLineEdit()
+        self.name_input.setMinimumHeight(36)
+        self.name_input.setPlaceholderText("例如：客服工单分类、调研开放题归纳")
         self.desc_input = QLineEdit()
+        self.desc_input.setMinimumHeight(36)
+        self.desc_input.setPlaceholderText("可选：一句话描述这个分析模型的用途")
         self.template_input = QComboBox()
+        self.template_input.setMinimumHeight(36)
         for k, label in SYSTEM_TEMPLATE_LABELS:
             self.template_input.addItem(label, k)
+
+        # Use a min-height instead of fixed-height so the editors aren't
+        # cramped — they were overlapping at fixed=72 on macOS.
         self.system_extra_input = QPlainTextEdit()
-        self.system_extra_input.setPlaceholderText("可选：附加的系统提示词，会拼到内置模板之后。")
-        self.system_extra_input.setFixedHeight(72)
+        self.system_extra_input.setPlaceholderText(
+            "可选：附加的系统提示词，会拼到内置模板之后。"
+        )
+        self.system_extra_input.setMinimumHeight(96)
+
         self.goal_input = QPlainTextEdit()
-        self.goal_input.setPlaceholderText("例：识别每条工单的根因类别与紧急程度，并给出处理建议。")
-        self.goal_input.setFixedHeight(72)
+        self.goal_input.setPlaceholderText(
+            "例：识别每条工单的根因类别与紧急程度，并给出处理建议。"
+        )
+        self.goal_input.setMinimumHeight(96)
+
         form.addRow("名称", self.name_input)
         form.addRow("描述", self.desc_input)
         form.addRow("内置模板", self.template_input)
@@ -262,9 +293,10 @@ class ModelPage(QWidget):
         self.fields_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.fields_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.fields_table.setAlternatingRowColors(True)
-        self.fields_table.setMinimumHeight(200)
+        self.fields_table.setMinimumHeight(280)
+        self.fields_table.verticalHeader().setDefaultSectionSize(40)
         fields_card.layout().addWidget(self.fields_table)
-        self._right_holder_lay.addWidget(fields_card, 1)
+        self._right_holder_lay.addWidget(fields_card)
 
         # ---- save row ----------------------------------------------------
         save_row = QHBoxLayout()

@@ -68,8 +68,8 @@ class ResultPage(QWidget):
             self._clear_layout()
         else:
             self._main = QVBoxLayout(self)
-            self._main.setContentsMargins(24, 20, 24, 20)
-            self._main.setSpacing(16)
+            self._main.setContentsMargins(28, 24, 28, 24)
+            self._main.setSpacing(18)
         es = h.empty_state(
             "还没有分析结果",
             "在『运行』页面选择配置与模型，上传数据 Excel 开始分析吧。",
@@ -161,6 +161,7 @@ class ResultPage(QWidget):
 
         # ---- bottom: raw data + errors ---------------------------------
         tabs = QTabWidget()
+        tabs.setMinimumHeight(260)
         tabs.addTab(self._build_data_table(result), "原始数据 + 输出")
         tabs.addTab(self._build_error_table(result), f"错误（{sum(1 for e in result.row_errors if e)}）")
         self._main.addWidget(tabs)

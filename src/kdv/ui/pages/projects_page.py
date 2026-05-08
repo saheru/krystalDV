@@ -34,8 +34,8 @@ class ProjectsPage(QWidget):
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 20, 24, 20)
-        root.setSpacing(16)
+        root.setContentsMargins(28, 24, 28, 24)
+        root.setSpacing(18)
 
         head = QHBoxLayout()
         head.addWidget(h.heading("分析项目", level=1))
@@ -44,7 +44,9 @@ class ProjectsPage(QWidget):
         refresh_btn.clicked.connect(self.refresh)
         head.addWidget(refresh_btn)
         root.addLayout(head)
-        root.addWidget(h.muted("每次分析完成后会自动保存为项目。点击重新打开查看图表/对话/数据。"))
+        intro = h.muted("每次分析完成后会自动保存为项目。点击重新打开查看图表/对话/数据。")
+        intro.setWordWrap(True)
+        root.addWidget(intro)
 
         self.list = QListWidget()
         self.list.setSpacing(0)
@@ -82,7 +84,7 @@ class ProjectsPage(QWidget):
             return
         for meta in items:
             it = QListWidgetItem()
-            it.setSizeHint(QSize(0, 96))
+            it.setSizeHint(QSize(0, 110))
             it.setData(Qt.UserRole, meta.project_id)
             self.list.addItem(it)
             self.list.setItemWidget(it, self._render_card(meta))

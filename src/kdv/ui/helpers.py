@@ -20,6 +20,33 @@ from PySide6.QtWidgets import (
 from kdv.ui import style
 
 
+def make_scroll_page(parent: QWidget) -> tuple[QVBoxLayout, QWidget]:
+    """Wrap `parent`'s content in a vertical QScrollArea.
+
+    Returns `(content_layout, content_widget)` — populate `content_layout`
+    instead of building directly on `parent`. The page no longer fights
+    to fit on one screen; long forms scroll naturally.
+    """
+    from PySide6.QtWidgets import QScrollArea as _QSA
+
+    outer = QVBoxLayout(parent)
+    outer.setContentsMargins(0, 0, 0, 0)
+    outer.setSpacing(0)
+    scroll = _QSA()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(_QSA.NoFrame)
+    scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    outer.addWidget(scroll)
+    page = QWidget()
+    page.setObjectName("page")
+    scroll.setWidget(page)
+    inner = QVBoxLayout(page)
+    inner.setContentsMargins(28, 24, 28, 32)
+    inner.setSpacing(22)
+    return inner, page
+
+
 def make_card(parent: QWidget | None = None, *, padding: int = 18, shadow: bool = False) -> QFrame:
     """A rounded white container with hover-lift via QSS only.
 

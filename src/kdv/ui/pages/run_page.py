@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -47,9 +48,9 @@ class RunPage(QWidget):
 
     # ---- layout ----------------------------------------------------------
     def _build(self) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(28, 24, 28, 24)
-        root.setSpacing(20)
+        # The whole page lives in a vertical scroll area so sections can
+        # breathe instead of compressing into one screen height.
+        root, _page = h.make_scroll_page(self)
 
         head = QHBoxLayout()
         head.setSpacing(12)
@@ -72,7 +73,6 @@ class RunPage(QWidget):
         pickers.setSpacing(16)
 
         preset_card = h.make_card()
-        preset_card.setMinimumHeight(170)
         ph = QHBoxLayout()
         ph.setContentsMargins(0, 0, 0, 0)
         ph.addWidget(h.heading("LLM 配置", level=3))
@@ -88,7 +88,6 @@ class RunPage(QWidget):
         preset_card.layout().addStretch(1)
 
         model_card = h.make_card()
-        model_card.setMinimumHeight(170)
         mh = QHBoxLayout()
         mh.setContentsMargins(0, 0, 0, 0)
         mh.addWidget(h.heading("分析模型", level=3))
@@ -150,9 +149,13 @@ class RunPage(QWidget):
         self._mode_buttons["row_by_row"].setChecked(True)
         mode_card.layout().addLayout(mode_row)
 
+        goal_label = h.muted("分析目标（可选 / 无模型时必填）")
+        mode_card.layout().addWidget(goal_label)
         self.extra_goal = QPlainTextEdit()
-        self.extra_goal.setPlaceholderText("可选：本次运行的临时分析目标（覆盖模型默认目标）。")
-        self.extra_goal.setFixedHeight(64)
+        self.extra_goal.setPlaceholderText(
+            "可选：本次运行的临时分析目标（覆盖模型默认目标）。无模型快速分析时这里必填——会作为 LLM 的核心问题。"
+        )
+        self.extra_goal.setMinimumHeight(96)
         mode_card.layout().addWidget(self.extra_goal)
         root.addWidget(mode_card)
 
@@ -179,8 +182,8 @@ class RunPage(QWidget):
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(2000)
         self.log.setPlaceholderText("运行日志会显示在这里…")
-        self.log.setMinimumHeight(120)
-        root.addWidget(self.log, 1)
+        self.log.setMinimumHeight(180)
+        root.addWidget(self.log)
 
     def _mode_button_qss(self) -> str:
         return """
