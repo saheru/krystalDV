@@ -310,21 +310,62 @@ def _slide_insights(prs: Presentation, payload: ExportPayload) -> None:
 def _slide_chart(prs: Presentation, *, title: str, rationale: str, png: bytes) -> None:
     s = _add_blank_slide(prs)
     _add_section_header(s, title=title)
-    if rationale:
+
+    # Decide layout: with analysis text → image on left 60%, text on right 40%.
+    # Without analysis → image full-width.
+    has_analysis = bool(rationale and len(rationale) > 30)
+
+    if has_analysis and png:
+        img_left = Inches(0.5)
+        img_top = Inches(1.5)
+        img_width = Inches(7.6)
+        img_height = Inches(5.5)
+        s.shapes.add_picture(
+            io.BytesIO(png), img_left, img_top, width=img_width, height=img_height
+        )
+        # Analysis panel on the right
+        analysis_left = Inches(8.4)
+        analysis_top = Inches(1.5)
+        analysis_w = Inches(4.5)
+        analysis_h = Inches(5.5)
+        # Title of the analysis panel
+        _add_text(
+            s, text="📊 分析说明",
+            left=analysis_left, top=analysis_top,
+            width=analysis_w, height=Inches(0.45),
+            size=14, bold=True, color=PRIMARY,
+        )
+        # Body text (auto-wraps)
         _add_text(
             s, text=rationale,
-            left=Inches(0.85), top=Inches(1.25),
-            width=Inches(11.5), height=Inches(0.4),
-            size=11, color=TEXT_MUTED,
+            left=analysis_left, top=analysis_top + Inches(0.55),
+            width=analysis_w, height=analysis_h - Inches(0.55),
+            size=12, color=TEXT,
         )
-    if png:
-        # Place image centred horizontally with max-width 12 in
-        img_left = Inches(0.85)
-        img_top = Inches(1.8)
-        img_width = Inches(11.5)
-        img_height = Inches(5.2)
-        s.shapes.add_picture(io.BytesIO(png), img_left, img_top,
-                             width=img_width, height=img_height)
+    else:
+        if rationale:
+            _add_text(
+                s, text=rationale,
+                left=Inches(0.85), top=Inches(1.25),
+                width=Inches(11.5), height=Inches(0.4),
+                size=11, color=TEXT_MUTED,
+            )
+        if png:
+            img_left = Inches(0.85)
+            img_top = Inches(1.8)
+            img_width = Inches(11.5)
+            img_height = Inches(5.2)
+            s.shapes.add_picture(
+                io.BytesIO(png), img_left, img_top, width=img_width, height=img_height
+            )
+        else:
+            # Capture failed — show a hint instead of an empty slide
+            _add_text(
+                s, text="（图表截图获取失败，可重新点击导出再试）",
+                left=Inches(0.85), top=Inches(3.5),
+                width=Inches(11.5), height=Inches(0.6),
+                size=14, color=TEXT_MUTED, align=PP_ALIGN.CENTER,
+            )
 
 
 def _slide_data_sample(prs: Presentation, payload: ExportPayload) -> None:

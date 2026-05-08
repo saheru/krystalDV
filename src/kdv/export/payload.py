@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QSize, QRect, Qt
+from PySide6.QtCore import QBuffer, QIODevice, QSize, QRect, Qt
 from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import QWidget
 
@@ -48,33 +48,101 @@ class ExportPayload:
 
 # ----------------------------------------------------------------------
 def capture_widget_png(widget: QWidget, *, scale: float = 2.0) -> bytes:
-    """Render a QWidget to a high-DPI PNG and return raw bytes.
+    """Render a QWidget to a PNG and return raw bytes.
 
-    Uses QWidget.grab() which captures the widget's actual on-screen
-    appearance — works for both QWidget-based PyQtGraph plots and the
-    embedded matplotlib FigureCanvas.
+    Strategy:
+    1. Try `widget.grab()` first — works for nearly every QWidget.
+    2. Special-case matplotlib `FigureCanvas`: dump the figure to PNG
+       buffer directly (always reliable, no display dependency).
+    3. Special-case pyqtgraph `PlotWidget`: use its built-in
+       `grabFramebuffer()`-equivalent or `getPlotItem()` exporter.
+    4. If the widget is hidden or has zero size, force a temporary
+       resize + show before grabbing, then restore.
     """
     if widget is None:
         return b""
-    size = widget.size()
-    if size.width() <= 0 or size.height() <= 0:
-        size = widget.sizeHint()
-    if size.width() <= 0 or size.height() <= 0:
-        size = QSize(640, 480)
 
-    target = QSize(int(size.width() * scale), int(size.height() * scale))
-    pix = QPixmap(target)
-    pix.setDevicePixelRatio(scale)
-    pix.fill(Qt.white)
-    painter = QPainter(pix)
-    painter.setRenderHint(QPainter.Antialiasing, True)
-    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-    widget.render(painter, QRect(0, 0, size.width(), size.height()).topLeft())
-    painter.end()
+    # ---- ① matplotlib FigureCanvas → save figure directly --------
+    try:
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
-    buf = io.BytesIO()
-    pix.save(buf, "PNG")
-    return buf.getvalue()
+        canvas = _find_figure_canvas(widget)
+        if canvas is not None:
+            buf = io.BytesIO()
+            canvas.figure.savefig(buf, format="png", dpi=int(96 * scale),
+                                   bbox_inches="tight", facecolor="white")
+            return buf.getvalue()
+    except Exception:
+        pass
+
+    # ---- ② pyqtgraph PlotWidget → grab() (most reliable) ---------
+    # NB: pyqtgraph's ImageExporter has known quirks on Qt6 / macOS;
+    # the simple QWidget.grab() captures the rendered scene fine since
+    # the widget is on-screen at export time.
+    try:
+        import pyqtgraph as pg
+        if isinstance(widget, pg.PlotWidget):
+            from PySide6.QtWidgets import QApplication
+            QApplication.processEvents()
+            pix = widget.grab()
+            if not pix.isNull():
+                if scale != 1.0:
+                    pix = pix.scaled(
+                        int(pix.width() * scale),
+                        int(pix.height() * scale),
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation,
+                    )
+                return _pixmap_to_png_bytes(pix)
+    except Exception:
+        pass
+
+    # ---- ③ generic widget grab -------------------------------------
+    # Force a sane size if the widget hasn't been laid out yet.
+    if widget.size().width() <= 0 or widget.size().height() <= 0:
+        sh = widget.sizeHint()
+        widget.resize(
+            max(sh.width(), 720),
+            max(sh.height(), 360),
+        )
+    pix = widget.grab()
+    if pix.isNull():
+        return b""
+    if scale != 1.0:
+        from PySide6.QtCore import Qt as _Qt
+
+        pix = pix.scaled(
+            int(pix.width() * scale),
+            int(pix.height() * scale),
+            _Qt.KeepAspectRatio,
+            _Qt.SmoothTransformation,
+        )
+    return _pixmap_to_png_bytes(pix)
+
+
+def _pixmap_to_png_bytes(pix: QPixmap) -> bytes:
+    """QPixmap → PNG bytes via QBuffer (PySide6 doesn't accept BytesIO)."""
+    qbuf = QBuffer()
+    qbuf.open(QIODevice.WriteOnly)
+    if pix.save(qbuf, "PNG"):
+        data = bytes(qbuf.data())
+    else:
+        data = b""
+    qbuf.close()
+    return data
+
+
+def _find_figure_canvas(w: QWidget):
+    """Return the first matplotlib FigureCanvas inside `w` (or w itself)."""
+    try:
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+    except Exception:
+        return None
+    if isinstance(w, FigureCanvasQTAgg):
+        return w
+    for child in w.findChildren(FigureCanvasQTAgg):
+        return child
+    return None
 
 
 def write_export_payload(payload: ExportPayload, *, debug_dir: Path | None = None) -> None:

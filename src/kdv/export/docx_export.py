@@ -282,11 +282,24 @@ def _add_charts(doc: Document, payload: ExportPayload) -> None:
     _heading(doc, "图表", level=1)
     for ci in payload.charts:
         _heading(doc, ci.title, level=2)
-        if ci.rationale:
-            _muted_p(doc, ci.rationale)
         if ci.png_bytes:
             doc.add_picture(io.BytesIO(ci.png_bytes), width=Cm(15.5))
-        # Add small spacer
+        else:
+            _muted_p(doc, "（图表截图获取失败，请重新点击导出）")
+        # When the rationale is short → small caption only.
+        # When it's long (LLM-generated) → full sub-heading + paragraph.
+        if ci.rationale:
+            if len(ci.rationale) > 30:
+                p = doc.add_paragraph()
+                run = p.add_run("📊 分析说明")
+                run.bold = True
+                run.font.color.rgb = PRIMARY
+                run.font.size = Pt(12)
+                p.paragraph_format.space_before = Pt(6)
+                p.paragraph_format.space_after = Pt(2)
+                _render_markdown(doc, ci.rationale)
+            else:
+                _muted_p(doc, ci.rationale)
         doc.add_paragraph()
 
 
