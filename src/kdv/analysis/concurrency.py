@@ -23,7 +23,9 @@ async def run_bounded(
 ) -> list[TaskOutcome]:
     """Run async callables with a semaphore. Returns outcomes in completion order.
 
-    If `cancel_event` is set, no new tasks start; tasks already running run to completion.
+    Cancellation is responsive: when `cancel_event` is set, all in-flight
+    asyncio tasks get `.cancel()`-ed so they don't keep retrying or
+    waiting on slow HTTP responses.
     """
     sem = asyncio.Semaphore(max(1, max_concurrency))
     outcomes: list[TaskOutcome] = []
@@ -39,6 +41,10 @@ async def run_bounded(
             try:
                 result = await fn()
                 err: str | None = None
+            except asyncio.CancelledError:
+                # Re-raise so the gather loop sees it; we surface as
+                # outcome below in the cancellation path.
+                raise
             except Exception as e:  # noqa: BLE001
                 result = None
                 err = str(e)
@@ -51,7 +57,35 @@ async def run_bounded(
                     pass
             return outcome
 
-    coros = [asyncio.create_task(runner(idx, fn)) for idx, fn in tasks]
-    for c in asyncio.as_completed(coros):
-        outcomes.append(await c)
+    pending: list[asyncio.Task] = [
+        asyncio.create_task(runner(idx, fn)) for idx, fn in tasks
+    ]
+
+    # Watcher: when cancel_event fires, .cancel() every still-running task
+    # so they bail out of httpx.post / asyncio.sleep / retry waits.
+    watcher: asyncio.Task | None = None
+    if cancel_event is not None:
+        async def _watch_cancel() -> None:
+            await cancel_event.wait()
+            for t in pending:
+                if not t.done():
+                    t.cancel()
+        watcher = asyncio.create_task(_watch_cancel())
+
+    try:
+        for done in asyncio.as_completed(pending):
+            try:
+                outcomes.append(await done)
+            except asyncio.CancelledError:
+                outcomes.append(
+                    TaskOutcome(index=-1, result=None, error="cancelled", duration_ms=0)
+                )
+    finally:
+        if watcher is not None and not watcher.done():
+            watcher.cancel()
+            try:
+                await watcher
+            except (asyncio.CancelledError, Exception):
+                pass
+
     return outcomes

@@ -44,6 +44,10 @@ class LLMClient:
         self.preset = preset
         self._api_key = api_key
         self._http: httpx.AsyncClient | None = None
+        # Sticky flag: once a proxy proves it can't handle `tools` (empty
+        # 200 or 400 mentioning tool/function), all subsequent calls in
+        # this client instance skip tools and use prompt-only mode.
+        self._tools_unsupported: bool = False
 
     async def __aenter__(self) -> "LLMClient":
         headers = {
@@ -134,6 +138,16 @@ class LLMClient:
         }
 
         mode = self.preset.structured_mode
+        # If a previous call from this client proved the proxy ignores tools,
+        # don't bother sending them again — go straight to prompt mode.
+        if self._tools_unsupported and mode == "auto":
+            return await self._chat_prompt_fallback(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                schema_fields=schema_fields,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
         use_fc = bool(schema_fields) and mode in ("auto", "function_calling")
         if use_fc:
             tool = build_tool_spec(schema_fields, "emit_analysis")
@@ -168,11 +182,25 @@ class LLMClient:
             data = r.json()
         except (json.JSONDecodeError, ValueError) as e:
             raw = (r.text or "").strip()[:300] or "<empty body>"
-            # Empty / non-JSON 200 response is almost always proxy
-            # overload from too many concurrent requests. Surface a hint.
-            hint = ""
-            if not raw or raw == "<empty body>":
-                hint = "（代理过载——建议把『并发』调到 3-5 再试）"
+            empty = (raw == "<empty body>")
+            # If we sent tools and the proxy responded with HTTP 200 +
+            # empty body, the proxy almost certainly doesn't support
+            # OpenAI function calling (common with Chinese Claude proxies).
+            # Mark tools as unsupported and retry without them.
+            if empty and use_fc and self.preset.structured_mode == "auto":
+                self._tools_unsupported = True
+                logger.info(
+                    "empty 200 with tools enabled → proxy lacks function-calling; "
+                    "switching client to prompt-mode for the rest of this run"
+                )
+                return await self._chat_prompt_fallback(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    schema_fields=schema_fields,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            hint = "（代理过载——建议把『并发』调到 3-5 再试）" if empty else ""
             raise RetryableLLMError(
                 f"响应不是 JSON（HTTP {r.status_code}）: {raw!r}{hint}"
             ) from e
@@ -239,8 +267,15 @@ class LLMClient:
             data = r.json()
         except (json.JSONDecodeError, ValueError) as e:
             raw = (r.text or "").strip()[:300] or "<empty body>"
+            extra = ""
+            if raw == "<empty body>":
+                extra = (
+                    "（你的 LLM 代理可能不支持 OpenAI function calling。"
+                    "Agent 模式必须靠工具调用——请换一个支持的端点，"
+                    "或把『结构化模式』设为 prompt 走逐行/汇总模式）"
+                )
             raise RetryableLLMError(
-                f"响应不是 JSON（HTTP {r.status_code}）: {raw!r}"
+                f"响应不是 JSON（HTTP {r.status_code}）: {raw!r}{extra}"
             ) from e
         return _parse_chat_response(data, expect_tool=True)
 
