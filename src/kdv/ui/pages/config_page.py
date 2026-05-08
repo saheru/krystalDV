@@ -1,7 +1,6 @@
 """Config page — manage LLM presets (base url, key, model, params)."""
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime
 
 import qasync
@@ -15,6 +14,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QVBoxLayout,
@@ -27,6 +28,10 @@ from kdv.llm.client import LLMClient
 from kdv.ui import helpers as h
 from kdv.ui.animations import fade_in
 from kdv.ui.state import AppState
+
+
+# Fixed list-item height so two-line content always fits without overlap.
+LIST_ITEM_HEIGHT = 64
 
 
 class ConfigPage(QWidget):
@@ -63,22 +68,33 @@ class ConfigPage(QWidget):
         left_lay = left.layout()
         left_lay.addWidget(h.heading("我的预设", level=3))
         self.list = QListWidget()
-        self.list.setSpacing(0)
+        self.list.setSpacing(6)
+        self.list.setUniformItemSizes(True)
+        self.list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         self.list.itemSelectionChanged.connect(self._on_select)
         left_lay.addWidget(self.list)
         split.addWidget(left)
 
-        right = h.make_card(padding=20)
-        right_lay = right.layout()
-        right_lay.addWidget(h.heading("详情", level=2))
+        # Right side wrapped in a scroll area so the action buttons are always reachable.
+        right_card = h.make_card(padding=20)
+        right_card_lay = right_card.layout()
+        right_card_lay.addWidget(h.heading("详情", level=2))
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QScrollArea.NoFrame)
+        self._scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        right_card_lay.addWidget(self._scroll, 1)
+
+        # Holder placed inside scroll area
         self._detail_holder = QWidget()
+        self._detail_holder.setObjectName("page")
         self._detail_holder_lay = QVBoxLayout(self._detail_holder)
         self._detail_holder_lay.setContentsMargins(0, 0, 0, 0)
-        self._detail_holder_lay.setSpacing(12)
-        right_lay.addWidget(self._detail_holder, 1)
+        self._detail_holder_lay.setSpacing(14)
+        self._scroll.setWidget(self._detail_holder)
 
-        # form fields built lazily on selection so we can reuse for empty state
-        split.addWidget(right)
+        split.addWidget(right_card)
         split.setSizes([320, 720])
         root.addWidget(split, 1)
 
@@ -89,13 +105,19 @@ class ConfigPage(QWidget):
             w = it.widget()
             if w:
                 w.deleteLater()
+            else:
+                lay = it.layout()
+                if lay is not None:
+                    self._delete_layout(lay)
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignRight)
-        form.setHorizontalSpacing(20)
-        form.setVerticalSpacing(12)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(10)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("例如：DeepSeek 主账号")
         self.base_url_input = QLineEdit()
         self.base_url_input.setPlaceholderText("https://api.openai.com/v1")
         self.api_key_input = QLineEdit()
@@ -103,12 +125,12 @@ class ConfigPage(QWidget):
         self.api_key_input.setPlaceholderText("sk-...")
         self.show_key_btn = h.ghost_button("显示")
         self.show_key_btn.clicked.connect(self._toggle_show_key)
-        key_row = QHBoxLayout()
+        key_wrap = QWidget()
+        key_row = QHBoxLayout(key_wrap)
         key_row.setContentsMargins(0, 0, 0, 0)
+        key_row.setSpacing(6)
         key_row.addWidget(self.api_key_input, 1)
         key_row.addWidget(self.show_key_btn)
-        key_wrap = QWidget()
-        key_wrap.setLayout(key_row)
 
         self.model_input = QLineEdit()
         self.model_input.setPlaceholderText("gpt-4o-mini / deepseek-chat / glm-4 ...")
@@ -135,6 +157,23 @@ class ConfigPage(QWidget):
         self.struct_mode = QComboBox()
         self.struct_mode.addItems(["auto（推荐）", "function_calling（强制）", "prompt（兼容）"])
 
+        for w in (
+            self.name_input,
+            self.base_url_input,
+            self.api_key_input,
+            self.model_input,
+        ):
+            w.setMinimumHeight(34)
+        for w in (
+            self.temp_input,
+            self.maxtok_input,
+            self.timeout_input,
+            self.concurrency_input,
+            self.retries_input,
+            self.struct_mode,
+        ):
+            w.setMinimumHeight(34)
+
         form.addRow("名称", self.name_input)
         form.addRow("Base URL", self.base_url_input)
         form.addRow("API Key", key_wrap)
@@ -149,16 +188,19 @@ class ConfigPage(QWidget):
         self._detail_holder_lay.addLayout(form)
 
         status_row = QHBoxLayout()
-        self.status_badge = h.badge("未测试", "muted")
-        self.status_msg = h.muted("")
+        status_row.setSpacing(8)
         status_row.addWidget(QLabel("连接状态："))
+        self.status_badge = h.badge("未测试", "muted")
         status_row.addWidget(self.status_badge)
+        self.status_msg = h.muted("")
+        self.status_msg.setWordWrap(True)
         status_row.addWidget(self.status_msg, 1)
         self._detail_holder_lay.addLayout(status_row)
 
         self._detail_holder_lay.addWidget(h.hline())
 
         actions = QHBoxLayout()
+        actions.setSpacing(10)
         self.test_btn = h.primary_button("测试连接")
         self.test_btn.clicked.connect(self._on_test)
         self.save_btn = h.primary_button("保存")
@@ -171,12 +213,29 @@ class ConfigPage(QWidget):
         actions.addWidget(self.delete_btn)
         self._detail_holder_lay.addLayout(actions)
 
+        self._detail_holder_lay.addStretch(1)
+
+    def _delete_layout(self, lay) -> None:
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+            else:
+                child = it.layout()
+                if child is not None:
+                    self._delete_layout(child)
+
     def _show_empty(self) -> None:
         while self._detail_holder_lay.count():
             it = self._detail_holder_lay.takeAt(0)
             w = it.widget()
             if w:
                 w.deleteLater()
+            else:
+                lay = it.layout()
+                if lay is not None:
+                    self._delete_layout(lay)
         es = h.empty_state(
             "还没有 LLM 配置",
             "新建一个 OpenAI 兼容的服务配置，例如 DeepSeek、智谱 GLM、Moonshot 或 OpenAI 本身。",
@@ -184,6 +243,7 @@ class ConfigPage(QWidget):
             self._on_new,
         )
         self._detail_holder_lay.addWidget(es)
+        self._detail_holder_lay.addStretch(1)
         fade_in(es)
 
     # ---- list -------------------------------------------------------------
@@ -192,18 +252,17 @@ class ConfigPage(QWidget):
         items = self.state.presets.list()
         for p in items:
             it = QListWidgetItem()
+            it.setSizeHint(self._list_item_size())
+            it.setData(Qt.UserRole, p.id)
             self.list.addItem(it)
             w = self._render_list_item(p)
-            it.setSizeHint(w.sizeHint())
             self.list.setItemWidget(it, w)
-            it.setData(Qt.UserRole, p.id)
 
         if not items:
             self._current = None
             self._show_empty()
             return
 
-        # restore selection
         target_id = self.state.settings.settings.last_preset_id or items[0].id
         for i in range(self.list.count()):
             if self.list.item(i).data(Qt.UserRole) == target_id:
@@ -211,23 +270,47 @@ class ConfigPage(QWidget):
                 return
         self.list.setCurrentRow(0)
 
+    def _list_item_size(self):
+        from PySide6.QtCore import QSize
+
+        # Wider than the column so eliding kicks in instead of clipping behind scrollbar
+        return QSize(0, LIST_ITEM_HEIGHT)
+
     def _render_list_item(self, p: LLMPreset) -> QWidget:
         w = QWidget()
+        w.setFixedHeight(LIST_ITEM_HEIGHT - 4)
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(4, 4, 4, 4)
-        lay.setSpacing(4)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(2)
+
         head = QHBoxLayout()
+        head.setSpacing(8)
         title = QLabel(p.name or "(未命名)")
-        title.setStyleSheet("font-weight: 600;")
-        head.addWidget(title)
-        head.addStretch(1)
+        title.setStyleSheet("font-weight: 600; font-size: 13px; background: transparent;")
+        title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        title.setMaximumWidth(180)
+        title.setTextFormat(Qt.PlainText)
+        head.addWidget(title, 1)
         kind = {"ok": "success", "fail": "danger", "unknown": "muted"}[p.last_test_status]
-        head.addWidget(h.badge({"ok": "连通", "fail": "失败", "unknown": "未测"}[p.last_test_status], kind))
+        head.addWidget(
+            h.badge(
+                {"ok": "连通", "fail": "失败", "unknown": "未测"}[p.last_test_status],
+                kind,
+            )
+        )
         lay.addLayout(head)
-        sub = QLabel(f"{p.model}  ·  {p.base_url}")
-        sub.setStyleSheet("color: #6B7280; font-size: 12px;")
-        sub.setMaximumWidth(280)
-        sub.setWordWrap(False)
+
+        sub = QLabel(f"{p.model} · {p.base_url}")
+        sub.setStyleSheet(
+            "color: #6B7280; font-size: 11px; background: transparent;"
+        )
+        sub.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        sub.setTextFormat(Qt.PlainText)
+        # Manual elide to avoid the label overflowing past the list item bounds
+        from PySide6.QtGui import QFontMetrics
+
+        fm = QFontMetrics(sub.font())
+        sub.setText(fm.elidedText(sub.text(), Qt.ElideRight, 240))
         lay.addWidget(sub)
         return w
 

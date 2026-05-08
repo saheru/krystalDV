@@ -1,4 +1,9 @@
-"""Reusable QPropertyAnimation helpers."""
+"""Reusable QPropertyAnimation helpers.
+
+IMPORTANT: QGraphicsOpacityEffect attached to a widget can interfere with
+keyboard input / IME / focus on its child input widgets. So every fade
+animation here REMOVES the effect after completion.
+"""
 from __future__ import annotations
 
 from PySide6.QtCore import (
@@ -12,8 +17,13 @@ from PySide6.QtCore import (
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
 
 
+def _clear_effect_later(widget: QWidget) -> None:
+    """Detach any QGraphicsEffect on the next event-loop tick."""
+    QTimer.singleShot(0, lambda: widget and widget.setGraphicsEffect(None))
+
+
 def fade_in(widget: QWidget, *, duration_ms: int = 220) -> QPropertyAnimation:
-    """Fade in via QGraphicsOpacityEffect. Animation is parented to the widget."""
+    """Fade in via a temporary QGraphicsOpacityEffect that is detached on finish."""
     effect = QGraphicsOpacityEffect(widget)
     effect.setOpacity(0.0)
     widget.setGraphicsEffect(effect)
@@ -22,6 +32,7 @@ def fade_in(widget: QWidget, *, duration_ms: int = 220) -> QPropertyAnimation:
     anim.setStartValue(0.0)
     anim.setEndValue(1.0)
     anim.setEasingCurve(QEasingCurve.OutCubic)
+    anim.finished.connect(lambda w=widget: _clear_effect_later(w))
     anim.start(QPropertyAnimation.DeleteWhenStopped)
     return anim
 
@@ -29,13 +40,12 @@ def fade_in(widget: QWidget, *, duration_ms: int = 220) -> QPropertyAnimation:
 def slide_in(
     widget: QWidget, *, direction: str = "right", offset_px: int = 24, duration_ms: int = 260
 ) -> QParallelAnimationGroup:
-    """Slide + fade. `direction`: right|left|up|down (the side the widget arrives from)."""
+    """Slide + fade. Effect removed after finish so child inputs stay responsive."""
     effect = QGraphicsOpacityEffect(widget)
     effect.setOpacity(0.0)
     widget.setGraphicsEffect(effect)
 
     start_geo = widget.geometry()
-    delta = QObject  # placeholder to avoid mypy noise
     dx = dy = 0
     if direction == "right":
         dx = offset_px
@@ -62,6 +72,7 @@ def slide_in(
     group = QParallelAnimationGroup(widget)
     group.addAnimation(geo_anim)
     group.addAnimation(op_anim)
+    group.finished.connect(lambda w=widget: _clear_effect_later(w))
     group.start(QParallelAnimationGroup.DeleteWhenStopped)
     return group
 
@@ -77,10 +88,11 @@ def pulse(widget: QWidget, *, duration_ms: int = 220) -> QPropertyAnimation:
     anim.setKeyValueAt(0.5, 0.55)
     anim.setKeyValueAt(1, 1.0)
     anim.setEasingCurve(QEasingCurve.InOutSine)
+    anim.finished.connect(lambda w=widget: _clear_effect_later(w))
     anim.start(QPropertyAnimation.DeleteWhenStopped)
     return anim
 
 
+# Backward-compat shim (unused now).
 def schedule_clear_effect(widget: QWidget, delay_ms: int = 400) -> None:
-    """Remove a graphics effect a moment after animation finishes (avoid leaks)."""
     QTimer.singleShot(delay_ms, lambda: widget.setGraphicsEffect(None))
