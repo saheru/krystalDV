@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from kdv.agent.manager import AgentManager
 from kdv.analysis.model import AnalysisModel, ModelStore
 from kdv.analysis.projects import ProjectStore
 from kdv.analysis.runner import RunResult
@@ -19,6 +20,7 @@ class AppState:
     settings: SettingsStore = field(default_factory=SettingsStore)
     secrets: SecretStore = field(default_factory=SecretStore)
     projects: ProjectStore = field(default_factory=ProjectStore)
+    agents: AgentManager = field(default_factory=AgentManager)
     last_run: RunResult | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 

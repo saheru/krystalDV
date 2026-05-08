@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 from kdv import __app_name__
 from kdv.ui import helpers as h
 from kdv.ui import style
+from kdv.ui.pages.agents_page import AgentsPage
 from kdv.ui.pages.config_page import ConfigPage
 from kdv.ui.pages.model_page import ModelPage
 from kdv.ui.pages.projects_page import ProjectsPage
@@ -29,6 +30,7 @@ NAV_ITEMS = [
     ("config", "⚙  LLM 配置"),
     ("model", "🧬  分析模型"),
     ("run", "▶  运行分析"),
+    ("agents", "🤖  Agent 中心"),
     ("result", "📊  结果可视化"),
     ("projects", "📁  项目历史"),
 ]
@@ -131,10 +133,12 @@ class MainWindow(QMainWindow):
         self.run_page = RunPage(self.state)
         self.result_page = ResultPage(self.state)
         self.projects_page = ProjectsPage(self.state)
+        self.agents_page = AgentsPage(self.state)
         self._page_index = {
             "config": self.stack.addWidget(self.config_page),
             "model": self.stack.addWidget(self.model_page),
             "run": self.stack.addWidget(self.run_page),
+            "agents": self.stack.addWidget(self.agents_page),
             "result": self.stack.addWidget(self.result_page),
             "projects": self.stack.addWidget(self.projects_page),
         }
@@ -150,7 +154,43 @@ class MainWindow(QMainWindow):
         self.model_page.models_changed.connect(self.run_page.refresh_pickers)
         self.run_page.run_completed.connect(self._on_run_completed)
         self.run_page.run_completed.connect(lambda _r: self.projects_page.refresh())
+        self.run_page.run_completed.connect(self._notify_run_completed)
+        self.run_page.agent_job_requested.connect(lambda: self._switch_to("agents"))
         self.projects_page.project_opened.connect(self._on_run_completed)
+        self.agents_page.open_in_results.connect(self._on_agent_result_open)
+        # Subscribe to every new agent job — show a clickable toast on finish.
+        self.state.agents.job_added.connect(self._track_agent_job)
+
+    def _on_agent_result_open(self, job) -> None:
+        """Convert an AgentJob's result into a RunResult-like view + open it."""
+        from kdv.analysis.runner import RunResult
+
+        if job.result is None:
+            return
+        # Build a synthetic RunResult so result_page can render it.
+        agent_summary = "\n\n".join(
+            f"## 任务 {i + 1}：{ts['task']}\n\n{ts['summary']}"
+            for i, ts in enumerate(job.result.task_summaries)
+        )
+        rr = RunResult(
+            run_id=job.id,
+            mode="agent",  # type: ignore[arg-type]
+            columns=list(job.columns),
+            rows=list(job.rows),
+            row_outputs=[None] * len(job.rows),
+            row_errors=[None] * len(job.rows),
+            summary_markdown=agent_summary,
+            summary_structured=None,
+            prompt_tokens_total=job.result.prompt_tokens_total,
+            completion_tokens_total=job.result.completion_tokens_total,
+            duration_ms_total=job.result.duration_ms_total,
+        )
+        # Stash agent artefacts so the result page can pre-populate
+        self.state.last_run = rr
+        self.state.extra["agent_charts"] = list(job.result.charts)
+        self.state.extra["agent_insights"] = list(job.result.insights)
+        self.result_page.render_result(rr)
+        self._switch_to("result")
 
     def _setup_shortcuts(self) -> None:
         for i, (key, _) in enumerate(NAV_ITEMS, start=1):
@@ -158,8 +198,49 @@ class MainWindow(QMainWindow):
             sc.activated.connect(lambda k=key: self._switch_to(k))
 
     def _on_run_completed(self, result) -> None:
+        # Always render so the result page is up-to-date; navigation is
+        # done via the clickable toast in `_notify_run_completed`.
         self.result_page.render_result(result)
-        self._switch_to("result")
+
+    def _notify_run_completed(self, result) -> None:
+        n = len(getattr(result, "rows", []))
+        h.toast(
+            self,
+            f"分析完成 · {n} 行 · 点击查看图表与洞察",
+            "success",
+            on_click=lambda: self._switch_to("result"),
+            action_text="查看结果 →",
+            duration_ms=8000,
+        )
+
+    def _track_agent_job(self, job) -> None:
+        """Hook a freshly-spawned AgentJob so we can toast on completion."""
+
+        def _on_finished(_result) -> None:
+            if job.status == "done":
+                h.toast(
+                    self,
+                    f"🤖 Agent 「{job.name}」 已完成 · 点击查看图表与洞察",
+                    "success",
+                    on_click=lambda j=job: self._on_agent_result_open(j),
+                    action_text="查看结果 →",
+                    duration_ms=10000,
+                )
+            elif job.status == "error":
+                h.toast(
+                    self,
+                    f"Agent 「{job.name}」 出错：{job.error[:80]}",
+                    "danger",
+                    duration_ms=6000,
+                )
+            elif job.status == "cancelled":
+                h.toast(
+                    self,
+                    f"Agent 「{job.name}」 已取消",
+                    "info",
+                )
+
+        job.finished.connect(_on_finished)
 
     # ---- nav --------------------------------------------------------------
     def _switch_to(self, key: str) -> None:

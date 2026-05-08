@@ -169,6 +169,19 @@ class ResultPage(QWidget):
         # Populate auto-recommended charts
         self._populate_auto_charts(result)
 
+        # If this is an agent-completed result, also inject the agent's
+        # pre-built charts/insights so the user sees them straight away.
+        agent_charts = self.state.extra.pop("agent_charts", None) or []
+        agent_insights = self.state.extra.pop("agent_insights", None) or []
+        for spec in agent_charts:
+            widget = self._build_chart_from_spec(spec)
+            if widget is None:
+                continue
+            card = self._wrap_chart_card(spec.title, spec.rationale, widget)
+            self._add_chart_card_to_grid(card)
+        for ins in agent_insights:
+            self._append_dynamic_insight(ins)
+
         # Spin up agent session for live chat
         preset = self.state.selected_preset()
         if preset and self.state.get_api_key(preset):

@@ -1,6 +1,7 @@
 """Agent mode: plan-act-observe loop with tool use and managed context."""
 
 from kdv.agent.context import ConversationContext, Message
+from kdv.agent.manager import AgentJob, AgentManager
 from kdv.agent.runner import AgentRunner, AgentResult, AgentTrace
 from kdv.agent.tools import ToolRegistry, build_default_registry
 from kdv.agent.trace import TraceEvent
@@ -11,6 +12,8 @@ __all__ = [
     "AgentRunner",
     "AgentResult",
     "AgentTrace",
+    "AgentJob",
+    "AgentManager",
     "ToolRegistry",
     "build_default_registry",
     "TraceEvent",

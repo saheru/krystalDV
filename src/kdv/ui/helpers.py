@@ -158,7 +158,12 @@ def empty_state(title: str, subtitle: str = "", action_text: str = "", on_action
 
 # -------- Toast ---------------------------------------------------------
 class Toast(QWidget):
-    """Self-dismissing top-right notification."""
+    """Self-dismissing top-right notification.
+
+    If `on_click` is provided, the toast becomes clickable: hovering shows
+    the pointer cursor + a "查看 →" hint, and clicking invokes the callback
+    and dismisses the toast.
+    """
 
     def __init__(
         self,
@@ -167,11 +172,17 @@ class Toast(QWidget):
         kind: Literal["success", "warning", "danger", "info"] = "info",
         *,
         duration_ms: int = 2400,
+        on_click=None,
+        action_text: str = "查看 →",
     ) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        # Allow mouse events only when there's a click handler.
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, on_click is None)
         self.setWindowFlags(Qt.SubWindow | Qt.FramelessWindowHint)
+        self._on_click = on_click
+        if on_click is not None:
+            self.setCursor(Qt.PointingHandCursor)
 
         bg, fg = {
             "success": ("#ECFDF5", style.SUCCESS),
@@ -185,9 +196,19 @@ class Toast(QWidget):
         )
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
         self._lbl = QLabel(text, self)
         self._lbl.setStyleSheet("background: transparent; border: none;")
-        lay.addWidget(self._lbl)
+        self._lbl.setWordWrap(True)
+        self._lbl.setMaximumWidth(440)
+        lay.addWidget(self._lbl, 1)
+        if on_click is not None:
+            action_lbl = QLabel(action_text, self)
+            action_lbl.setStyleSheet(
+                f"background: transparent; border: none; color: {fg}; "
+                "font-weight: 700;"
+            )
+            lay.addWidget(action_lbl)
         self.adjustSize()
 
         # position top-right of parent
@@ -205,7 +226,19 @@ class Toast(QWidget):
         self._fi.setEasingCurve(QEasingCurve.OutCubic)
         self._fi.start()
 
-        QTimer.singleShot(duration_ms, self._dismiss)
+        # Clickable toasts linger longer so the user has time to act.
+        actual_duration = max(duration_ms, 6000) if on_click is not None else duration_ms
+        QTimer.singleShot(actual_duration, self._dismiss)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if self._on_click is not None and event.button() == Qt.LeftButton:
+            try:
+                self._on_click()
+            except Exception:
+                pass
+            self._dismiss()
+            return
+        super().mousePressEvent(event)
 
     def _dismiss(self) -> None:
         eff = self.graphicsEffect()
@@ -220,5 +253,13 @@ class Toast(QWidget):
         anim.start()
 
 
-def toast(parent: QWidget, text: str, kind: Literal["success", "warning", "danger", "info"] = "info") -> None:
-    Toast(parent, text, kind)
+def toast(
+    parent: QWidget,
+    text: str,
+    kind: Literal["success", "warning", "danger", "info"] = "info",
+    *,
+    on_click=None,
+    action_text: str = "查看 →",
+    duration_ms: int = 2400,
+) -> None:
+    Toast(parent, text, kind, duration_ms=duration_ms, on_click=on_click, action_text=action_text)

@@ -25,8 +25,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from kdv.agent.runner import AgentRunner, AgentResult
+from kdv.agent.trace import TraceEvent
 from kdv.analysis.projects import ProjectSnapshot
-from kdv.analysis.runner import AnalysisRunner, RunProgress
+from kdv.analysis.runner import AnalysisRunner, RunProgress, RunResult
 from kdv.excel.reader import ExcelTable, read_excel
 from kdv.excel.writer import write_results
 from kdv.ui import helpers as h
@@ -36,6 +38,7 @@ from kdv.ui.state import AppState
 
 class RunPage(QWidget):
     run_completed = Signal(object)  # emits RunResult
+    agent_job_requested = Signal()    # ask main window to switch to Agents page
 
     def __init__(self, state: AppState) -> None:
         super().__init__()
@@ -67,6 +70,45 @@ class RunPage(QWidget):
         )
         intro.setWordWrap(True)
         root.addWidget(intro)
+
+        # ---- 使用说明 ---------------------------------------------------
+        guide = h.make_card()
+        guide.layout().addWidget(h.heading("4 种分析模式怎么选？", level=3))
+        guide_text = QLabel(
+            "<p style='line-height:1.7;'>"
+            "<b style='color:#5B6CFF;'>① 逐行分析</b> · "
+            "<i>每行单独跑一次 LLM，按你定义的字段输出结构化结果</i><br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;<b>适用</b>：客服工单分类、客户反馈打标、调研开放题归纳、数据清洗补全<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;<b>例子</b>：100 行客户评价 → 自动标注情感(正/负/中)、关键问题点、改进建议<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;<b>需要</b>：先到『分析模型』页定义输出字段（或上传含字段定义的 Excel 模板）<br><br>"
+
+            "<b style='color:#5B6CFF;'>② 整表汇总</b> · "
+            "<i>把整张表一次性给 LLM，得到 Markdown 洞察报告</i><br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;<b>适用</b>：销售数据周报/月报、调研整体结论、数据集首次探索<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;<b>例子</b>：1000 行销售明细 → 关键洞察 / 趋势 / 异常 / 行动建议四章节<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;<b>无需</b>分析模型——选『（无模型）』即可，写下你想关注什么<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;<b>大表自动分块</b>：超过模型上下文会自动 map-reduce 不会爆<br><br>"
+
+            "<b style='color:#5B6CFF;'>③ 二者都做</b> · "
+            "<i>先逐行结构化，再用结构化结果做整表汇总</i><br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;<b>适用</b>：要既有每行的标签/分数，又要整体的趋势分析<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;<b>例子</b>：先给每条工单分类+紧急度，再生成『工单分布 + 高风险归类』汇总<br><br>"
+
+            "<b style='color:#5B6CFF;'>④ 🤖 Agent 智能分析</b> · "
+            "<i>多步循环：LLM 自主调用工具收集证据，输出图表 + 洞察</i><br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;<b>适用</b>：你不知道该怎么分析、想问开放性问题、需要对账/比对<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;<b>例子</b>：写下『把销售按地区做柱状图、找异常订单、计算金额和折扣相关性』，"
+            "agent 自己去做<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;<b>多任务</b>：每行一个任务；可以同时运行多个 agent（『Agent 中心』页统一管理）"
+            "</p>"
+        )
+        guide_text.setStyleSheet(
+            "color: #374151; font-size: 12px; background: transparent; border: none;"
+        )
+        guide_text.setWordWrap(True)
+        guide_text.setTextFormat(Qt.RichText)
+        guide.layout().addWidget(guide_text)
+        root.addWidget(guide)
 
         # ---- pickers row (two equal-width cards) ----------------------
         pickers = QHBoxLayout()
@@ -130,24 +172,35 @@ class RunPage(QWidget):
         # ---- mode + goal card -------------------------------------------
         mode_card = h.make_card()
         mode_card.layout().addWidget(h.heading("分析模式", level=3))
-        mode_row = QHBoxLayout()
+        from PySide6.QtWidgets import QGridLayout
+
+        mode_grid = QGridLayout()
+        mode_grid.setHorizontalSpacing(12)
+        mode_grid.setVerticalSpacing(12)
         self.mode_group = QButtonGroup(self)
         self._mode_buttons: dict[str, QPushButton] = {}
-        for key, label, desc in [
-            ("row_by_row", "逐行分析", "每行调用一次 LLM，输出结构化结果"),
+        mode_specs = [
+            ("row_by_row", "逐行分析", "每行调用一次 LLM，输出结构化结果（需要分析模型）"),
             ("summary", "整表汇总", "整体洞察 / 趋势 / 异常（Markdown）"),
-            ("both", "二者都做", "先逐行结构化，再做整表汇总"),
-        ]:
+            ("both", "二者都做", "先逐行结构化，再做整表汇总（需要分析模型）"),
+            (
+                "agent",
+                "🤖 Agent 智能分析",
+                "用工具调用循环：自主聚合/筛选/相关性/对账，输出图表与洞察",
+            ),
+        ]
+        for i, (key, label, desc) in enumerate(mode_specs):
             btn = QPushButton(f"{label}\n\n{desc}")
             btn.setCheckable(True)
-            btn.setMinimumHeight(72)
+            btn.setMinimumHeight(78)
             btn.setStyleSheet(self._mode_button_qss())
             btn.toggled.connect(self._restyle_mode_buttons)
+            btn.toggled.connect(self._on_mode_toggled)
             self.mode_group.addButton(btn)
             self._mode_buttons[key] = btn
-            mode_row.addWidget(btn)
+            mode_grid.addWidget(btn, i // 2, i % 2)
         self._mode_buttons["row_by_row"].setChecked(True)
-        mode_card.layout().addLayout(mode_row)
+        mode_card.layout().addLayout(mode_grid)
 
         goal_label = h.muted("分析目标（可选 / 无模型时必填）")
         mode_card.layout().addWidget(goal_label)
@@ -224,6 +277,24 @@ class RunPage(QWidget):
             b.style().unpolish(b)
             b.style().polish(b)
 
+    def _on_mode_toggled(self) -> None:
+        # The mode buttons toggle during _build before `extra_goal` exists.
+        if not hasattr(self, "extra_goal"):
+            return
+        mode = self._selected_mode()
+        if mode == "agent":
+            self.extra_goal.setPlaceholderText(
+                "Agent 模式：每行写一个分析任务，agent 会逐个完成并产出图表/洞察。例如：\n"
+                "  • 找出销售额最高的前 10 个供应商，做柱状图\n"
+                "  • 月度差额超 5% 的渠道商挑出来\n"
+                "  • 计算金额和折扣的相关系数"
+            )
+        else:
+            self.extra_goal.setPlaceholderText(
+                "可选：本次运行的临时分析目标（覆盖模型默认目标）。"
+                "无模型快速分析时这里必填——会作为 LLM 的核心问题。"
+            )
+
     def _selected_mode(self) -> str:
         for k, b in self._mode_buttons.items():
             if b.isChecked():
@@ -278,23 +349,20 @@ class RunPage(QWidget):
         else:
             self.state.settings.update(last_model_id="")
             self.model_meta.setText(
-                "无模型快速分析：跳过逐行结构化输出，整表一次性给出 Markdown 洞察。"
+                "无模型快速分析：跳过逐行结构化输出，整表一次性给出 Markdown 洞察。\n"
+                "选『逐行 / 二者都做』需要先到『分析模型』页定义输出字段。"
             )
 
-        # When no model, only summary mode is sensible — disable the others.
-        no_model = not mid
-        if no_model:
-            for key in ("row_by_row", "both"):
-                btn = self._mode_buttons.get(key)
-                if btn:
-                    btn.setEnabled(False)
-                    if btn.isChecked():
-                        btn.setChecked(False)
-            self._mode_buttons["summary"].setEnabled(True)
+        # All three mode buttons stay enabled. The Run button itself does
+        # the gating — that way the user always knows what choices exist
+        # and gets a clear error message instead of silently-greyed buttons.
+        for btn in self._mode_buttons.values():
+            btn.setEnabled(True)
+        # If switching to "no model" while row_by_row or both is selected,
+        # default-flip to summary so the UI is consistent. The user can
+        # change it back at any time.
+        if not mid and self._selected_mode() != "summary":
             self._mode_buttons["summary"].setChecked(True)
-        else:
-            for btn in self._mode_buttons.values():
-                btn.setEnabled(True)
 
     # ---- data ------------------------------------------------------------
     def _on_upload(self) -> None:
@@ -343,6 +411,8 @@ class RunPage(QWidget):
     async def _on_run(self) -> None:
         pid = self.preset_picker.currentData()
         mid = self.model_picker.currentData()
+        mode = self._selected_mode()
+
         if not pid:
             h.toast(self.window(), "请先选择 LLM 配置", "warning")
             shake(self.preset_picker)
@@ -350,6 +420,55 @@ class RunPage(QWidget):
         if not self._data or not self._data.rows:
             h.toast(self.window(), "请上传数据 Excel", "warning")
             shake(self.upload_btn)
+            return
+
+        # Agent mode: hand off to AgentManager and jump to Agents page.
+        if mode == "agent":
+            preset = self.state.presets.get(pid)
+            if not preset:
+                return
+            api_key = self.state.get_api_key(preset)
+            if not api_key:
+                h.toast(self.window(), "API key 为空，请到配置页填写并保存", "danger")
+                return
+            tasks = [
+                t.strip()
+                for t in self.extra_goal.toPlainText().splitlines()
+                if t.strip()
+            ]
+            if not tasks:
+                h.toast(
+                    self.window(),
+                    "Agent 模式需要至少写一个任务（在分析目标里，每行一个）",
+                    "warning",
+                )
+                shake(self.extra_goal)
+                return
+            name = f"{Path(self._data.source_path).stem} · {datetime.now().strftime('%H:%M:%S')}"
+            self.state.agents.spawn(
+                name=name,
+                tasks=tasks,
+                preset=preset,
+                api_key=api_key,
+                columns=list(self._data.columns),
+                rows=list(self._data.rows),
+            )
+            h.toast(
+                self.window(),
+                f"已启动 Agent：{name}（共 {len(tasks)} 个任务）",
+                "success",
+            )
+            self.agent_job_requested.emit()
+            return
+
+        # Row/summary/both modes: existing AnalysisRunner path.
+        if mode in ("row_by_row", "both") and not mid:
+            h.toast(
+                self.window(),
+                "『逐行 / 二者都做』需要先选择一个分析模型——请到『分析模型』页创建。",
+                "warning",
+            )
+            shake(self.model_picker)
             return
         preset = self.state.presets.get(pid)
         model = self.state.models.get(mid) if mid else None
