@@ -28,6 +28,7 @@ class LLMResponse:
     used_function_calling: bool = False
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 class LLMClient:
@@ -168,6 +169,64 @@ class LLMClient:
         data = r.json()
         return _parse_chat_response(data, expect_tool=use_fc)
 
+    async def chat_with_tools(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        tool_choice: str | dict[str, Any] = "auto",
+    ) -> LLMResponse:
+        """Multi-turn chat with a list of available tools (agent loop).
+
+        Unlike `chat()`, the conversation history is passed verbatim and the
+        model picks among the supplied tools — or returns plain text — at will.
+        """
+
+        async def _call() -> LLMResponse:
+            return await self._chat_with_tools_once(
+                messages=messages,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tool_choice=tool_choice,
+            )
+
+        return await retry_async(_call, max_attempts=self.preset.max_retries)
+
+    async def _chat_with_tools_once(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        temperature: float | None,
+        max_tokens: int | None,
+        tool_choice: str | dict[str, Any],
+    ) -> LLMResponse:
+        if self._http is None:
+            raise LLMError("LLMClient 未进入 async context")
+        body: dict[str, Any] = {
+            "model": self.preset.model,
+            "messages": messages,
+            "temperature": self.preset.temperature if temperature is None else temperature,
+            "max_tokens": self.preset.max_tokens if max_tokens is None else max_tokens,
+            "tools": tools,
+            "tool_choice": tool_choice,
+        }
+        try:
+            r = await self._http.post("/chat/completions", json=body)
+        except (httpx.TimeoutException, httpx.NetworkError) as e:
+            raise RetryableLLMError(f"网络/超时：{e}") from e
+
+        if r.status_code in (408, 425, 429) or 500 <= r.status_code < 600:
+            raise RetryableLLMError(f"HTTP {r.status_code}: {r.text[:200]}")
+        if r.status_code == 401 or r.status_code == 403:
+            raise LLMError(f"鉴权失败（HTTP {r.status_code}）。")
+        if r.status_code >= 400:
+            raise LLMError(f"HTTP {r.status_code}: {r.text[:500]}")
+        return _parse_chat_response(r.json(), expect_tool=True)
+
     async def _chat_prompt_fallback(
         self,
         *,
@@ -216,16 +275,15 @@ def _parse_chat_response(data: dict[str, Any], *, expect_tool: bool) -> LLMRespo
     parsed: dict[str, Any] | None = None
     used_fc = False
     text = message.get("content") or ""
+    tool_calls = list(message.get("tool_calls") or [])
 
-    if expect_tool:
-        tool_calls = message.get("tool_calls") or []
-        if tool_calls:
-            try:
-                args = tool_calls[0]["function"]["arguments"]
-                parsed = json.loads(args) if isinstance(args, str) else args
-                used_fc = True
-            except Exception:
-                logger.exception("failed to parse tool_calls arguments")
+    if expect_tool and tool_calls:
+        try:
+            args = tool_calls[0]["function"]["arguments"]
+            parsed = json.loads(args) if isinstance(args, str) else args
+            used_fc = True
+        except Exception:
+            logger.exception("failed to parse tool_calls arguments")
 
     if parsed is None and text:
         parsed = _extract_json_from_text(text)
@@ -237,6 +295,7 @@ def _parse_chat_response(data: dict[str, Any], *, expect_tool: bool) -> LLMRespo
         used_function_calling=used_fc,
         prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
         completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+        tool_calls=tool_calls,
     )
 
 

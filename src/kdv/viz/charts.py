@@ -482,6 +482,47 @@ def make_stat_summary(stats: dict[str, ColumnStats]) -> QWidget:
     return table
 
 
+def make_reconcile_bar(
+    *, internal: list[tuple[str, float]], external: list[tuple[str, float]]
+) -> QWidget:
+    """Side-by-side bars: internal vs external value per group, with diff coloured."""
+    if not internal:
+        return _empty("无对账数据")
+    labels = [k for k, _ in internal]
+    int_v = [v for _, v in internal]
+    ext_map = dict(external)
+    ext_v = [float(ext_map.get(k, 0.0)) for k in labels]
+
+    p = _new_plot()
+    xs = list(range(len(labels)))
+    width = 0.36
+    int_bg = pg.BarGraphItem(
+        x=[x - width / 2 for x in xs],
+        height=int_v,
+        width=width,
+        brush=PALETTE[0],
+        pen=PALETTE[0],
+    )
+    ext_bg = pg.BarGraphItem(
+        x=[x + width / 2 for x in xs],
+        height=ext_v,
+        width=width,
+        brush=PALETTE[2],
+        pen=PALETTE[2],
+    )
+    p.addItem(int_bg)
+    p.addItem(ext_bg)
+    p.getAxis("bottom").setTicks([list(zip(xs, labels))])
+
+    legend = pg.LegendItem(offset=(-10, 10))
+    legend.setParentItem(p.getPlotItem())
+    legend.addItem(pg.BarGraphItem(x=[0], height=[1], width=0.5,
+                                    brush=PALETTE[0], pen=PALETTE[0]), "内部")
+    legend.addItem(pg.BarGraphItem(x=[0], height=[1], width=0.5,
+                                    brush=PALETTE[2], pen=PALETTE[2]), "外部")
+    return p
+
+
 def make_pivot(
     rows: list[dict[str, Any]], *, row_field: str, value_field: str, agg: str = "mean"
 ) -> QWidget:

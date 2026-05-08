@@ -23,6 +23,7 @@ from kdv.analysis.model import AnalysisModel
 from kdv.config.models import LLMPreset
 from kdv.llm.client import LLMClient, LLMError
 from kdv.llm.prompts import SYSTEM_TEMPLATES, build_row_prompt, build_summary_prompt
+from kdv.llm.tokens import context_window_for, estimate_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -251,27 +252,17 @@ class AnalysisRunner:
                 else:
                     merged_rows = list(rows)
 
+                summary_max = max(4096, self.preset.max_tokens)
                 async with LLMClient(self.preset, self.api_key) as client:
-                    sys_p, user_p = build_summary_prompt(
-                        system_extra=self._system_prompt(),
-                        analysis_goal=self._analysis_goal(),
-                        columns=merged_columns,
-                        rows=merged_rows,
-                        output_fields=None,
-                        use_function_calling=False,
-                    )
                     try:
-                        # Summary reports are long-form Markdown; ensure plenty
-                        # of headroom regardless of the per-row preset value.
-                        resp = await client.chat(
-                            system_prompt=sys_p,
-                            user_prompt=user_p,
-                            schema_fields=None,
-                            max_tokens=max(4096, self.preset.max_tokens),
+                        summary_md, pt, ct = await self._run_summary_with_chunking(
+                            client=client,
+                            columns=merged_columns,
+                            rows=merged_rows,
+                            summary_max_tokens=summary_max,
                         )
-                        summary_md = resp.text or None
-                        prompt_total += resp.prompt_tokens
-                        completion_total += resp.completion_tokens
+                        prompt_total += pt
+                        completion_total += ct
                     except Exception as e:  # noqa: BLE001
                         logger.exception("summary call failed")
                         summary_md = f"_整表汇总分析失败：{e}_"
@@ -296,3 +287,144 @@ class AnalysisRunner:
         finally:
             if owns_cache:
                 cache.close()
+
+    # ------------------------------------------------------------------
+    async def _run_summary_with_chunking(
+        self,
+        *,
+        client: LLMClient,
+        columns: list[str],
+        rows: list[dict[str, Any]],
+        summary_max_tokens: int,
+    ) -> tuple[str, int, int]:
+        """Token-aware summary. Splits into chunks and map-reduces if needed.
+
+        Returns (markdown, prompt_tokens, completion_tokens).
+        """
+        ctx_window = context_window_for(self.preset.model)
+        # Reserve room for system + user wrapping + the summary itself.
+        budget = max(2048, ctx_window - summary_max_tokens - 1500)
+        chunks = _split_rows_by_token_budget(rows, columns, budget)
+
+        if len(chunks) == 1:
+            sys_p, user_p = build_summary_prompt(
+                system_extra=self._system_prompt(),
+                analysis_goal=self._analysis_goal(),
+                columns=columns,
+                rows=chunks[0],
+                output_fields=None,
+                use_function_calling=False,
+                sample_limit=len(chunks[0]),
+            )
+            resp = await client.chat(
+                system_prompt=sys_p,
+                user_prompt=user_p,
+                schema_fields=None,
+                max_tokens=summary_max_tokens,
+            )
+            return resp.text or "", resp.prompt_tokens, resp.completion_tokens
+
+        logger.info(
+            "summary chunking: %d rows → %d chunks (window=%d, budget=%d)",
+            len(rows), len(chunks), ctx_window, budget,
+        )
+        partial_summaries: list[str] = []
+        total_pt = 0
+        total_ct = 0
+
+        # ---- map: per-chunk summary -------------------------------------
+        for i, chunk in enumerate(chunks):
+            sys_extra = (
+                self._system_prompt()
+                + f"\n\n（这是数据集的第 {i + 1}/{len(chunks)} 个分块，共 {len(rows)} 行。"
+                "请只从这个分块中提取关键观察，不要泛泛总结整个数据集——后续会有合并步骤。）"
+            )
+            sys_p, user_p = build_summary_prompt(
+                system_extra=sys_extra,
+                analysis_goal=self._analysis_goal(),
+                columns=columns,
+                rows=chunk,
+                output_fields=None,
+                use_function_calling=False,
+                sample_limit=len(chunk),
+            )
+            resp = await client.chat(
+                system_prompt=sys_p,
+                user_prompt=user_p,
+                schema_fields=None,
+                max_tokens=min(2048, summary_max_tokens),
+            )
+            partial_summaries.append(resp.text or "")
+            total_pt += resp.prompt_tokens
+            total_ct += resp.completion_tokens
+
+        # ---- reduce: synthesize -----------------------------------------
+        joined = "\n\n".join(
+            f"## 分块 {i + 1}/{len(chunks)} 的发现\n\n{s}"
+            for i, s in enumerate(partial_summaries)
+        )
+        reduce_sys = (
+            self._system_prompt()
+            + "\n\n你将看到对同一数据集多个分块的独立分析。请整合成一份统一的 Markdown 报告："
+            "## 关键洞察 / ## 数据质量观察 / ## 分布与异常 / ## 建议行动。避免照抄分块原文。"
+        )
+        if self._analysis_goal():
+            reduce_sys += f"\n\n分析目标：{self._analysis_goal()}"
+        resp = await client.chat(
+            system_prompt=reduce_sys,
+            user_prompt=joined,
+            schema_fields=None,
+            max_tokens=summary_max_tokens,
+        )
+        total_pt += resp.prompt_tokens
+        total_ct += resp.completion_tokens
+        final = (resp.text or "").rstrip()
+        if final:
+            final += (
+                f"\n\n---\n\n_本报告基于 {len(chunks)} 个数据分块（共 {len(rows)} 行）的 map-reduce 分析合成。_"
+            )
+        return final, total_pt, total_ct
+
+
+def _row_token_estimate(row: dict[str, Any], columns: list[str]) -> int:
+    """Approximate tokens used to render this row inside the summary prompt."""
+    parts = []
+    for c in columns:
+        v = row.get(c)
+        if v is None or v == "":
+            parts.append("")
+            continue
+        s = str(v)
+        if len(s) > 200:
+            s = s[:200] + "…"
+        parts.append(s)
+    return estimate_tokens(" | ".join(parts))
+
+
+def _split_rows_by_token_budget(
+    rows: list[dict[str, Any]], columns: list[str], budget: int
+) -> list[list[dict[str, Any]]]:
+    """Split rows into consecutive chunks each ≤ `budget` tokens of content.
+
+    Header tokens are counted once per chunk; per-row estimates use a 200-char
+    truncation to mirror what the prompt builder does.
+    """
+    if not rows:
+        return [[]]
+    header_tokens = estimate_tokens(" | ".join(columns)) + 16  # markdown overhead
+    chunks: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
+    cur_tokens = header_tokens
+    for r in rows:
+        rt = _row_token_estimate(r, columns) + 4  # | bars overhead
+        if cur and cur_tokens + rt > budget:
+            chunks.append(cur)
+            cur = []
+            cur_tokens = header_tokens
+        cur.append(r)
+        cur_tokens += rt
+    if cur:
+        chunks.append(cur)
+    if not chunks:
+        chunks = [list(rows)]
+    return chunks
