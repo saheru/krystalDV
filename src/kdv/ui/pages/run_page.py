@@ -1,0 +1,372 @@
+"""Run page — pick preset+model, upload data, configure, run with progress."""
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime
+from pathlib import Path
+
+import qasync
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QButtonGroup,
+    QComboBox,
+    QFileDialog,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from kdv.analysis.runner import AnalysisRunner, RunProgress
+from kdv.excel.reader import ExcelTable, read_excel
+from kdv.excel.writer import write_results
+from kdv.ui import helpers as h
+from kdv.ui.animations import fade_in
+from kdv.ui.state import AppState
+
+
+class RunPage(QWidget):
+    run_completed = Signal(object)  # emits RunResult
+
+    def __init__(self, state: AppState) -> None:
+        super().__init__()
+        self.state = state
+        self.setObjectName("page")
+        self._data: ExcelTable | None = None
+        self._cancel_event: asyncio.Event | None = None
+        self._build()
+        self.refresh_pickers()
+
+    # ---- layout ----------------------------------------------------------
+    def _build(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 20, 24, 20)
+        root.setSpacing(16)
+
+        head = QHBoxLayout()
+        head.addWidget(h.heading("运行分析", level=1))
+        head.addStretch(1)
+        root.addLayout(head)
+        root.addWidget(h.muted("选择 LLM 配置 + 分析模型 + 数据 Excel，配置分析模式并启动。"))
+
+        # ---- pickers row ------------------------------------------------
+        pickers = QHBoxLayout()
+
+        preset_card = h.make_card()
+        preset_card.layout().addWidget(h.heading("LLM 配置", level=3))
+        self.preset_picker = QComboBox()
+        self.preset_picker.currentIndexChanged.connect(self._on_pickers_changed)
+        preset_card.layout().addWidget(self.preset_picker)
+        self.preset_meta = h.muted("")
+        preset_card.layout().addWidget(self.preset_meta)
+        pickers.addWidget(preset_card)
+
+        model_card = h.make_card()
+        model_card.layout().addWidget(h.heading("分析模型", level=3))
+        self.model_picker = QComboBox()
+        self.model_picker.currentIndexChanged.connect(self._on_pickers_changed)
+        model_card.layout().addWidget(self.model_picker)
+        self.model_meta = h.muted("")
+        model_card.layout().addWidget(self.model_meta)
+        pickers.addWidget(model_card)
+
+        root.addLayout(pickers)
+
+        # ---- data card --------------------------------------------------
+        data_card = h.make_card()
+        data_head = QHBoxLayout()
+        data_head.addWidget(h.heading("输入数据", level=3))
+        data_head.addStretch(1)
+        self.upload_btn = h.primary_button("📂 上传数据 Excel")
+        self.upload_btn.clicked.connect(self._on_upload)
+        data_head.addWidget(self.upload_btn)
+        data_card.layout().addLayout(data_head)
+        self.data_meta = h.muted("尚未上传数据。")
+        data_card.layout().addWidget(self.data_meta)
+        self.data_preview = QTableWidget(0, 0)
+        self.data_preview.verticalHeader().setVisible(False)
+        self.data_preview.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.data_preview.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.data_preview.setMaximumHeight(220)
+        self.data_preview.setAlternatingRowColors(True)
+        data_card.layout().addWidget(self.data_preview)
+        root.addWidget(data_card)
+
+        # ---- mode + goal card -------------------------------------------
+        mode_card = h.make_card()
+        mode_card.layout().addWidget(h.heading("分析模式", level=3))
+        mode_row = QHBoxLayout()
+        self.mode_group = QButtonGroup(self)
+        self._mode_buttons: dict[str, QPushButton] = {}
+        for key, label, desc in [
+            ("row_by_row", "逐行分析", "每行调用一次 LLM，输出结构化结果"),
+            ("summary", "整表汇总", "整体洞察 / 趋势 / 异常（Markdown）"),
+            ("both", "二者都做", "先逐行结构化，再做整表汇总"),
+        ]:
+            btn = QPushButton(f"{label}\n\n{desc}")
+            btn.setCheckable(True)
+            btn.setMinimumHeight(72)
+            btn.setStyleSheet(self._mode_button_qss())
+            btn.toggled.connect(self._restyle_mode_buttons)
+            self.mode_group.addButton(btn)
+            self._mode_buttons[key] = btn
+            mode_row.addWidget(btn)
+        self._mode_buttons["row_by_row"].setChecked(True)
+        mode_card.layout().addLayout(mode_row)
+
+        self.extra_goal = QPlainTextEdit()
+        self.extra_goal.setPlaceholderText("可选：本次运行的临时分析目标（覆盖模型默认目标）。")
+        self.extra_goal.setFixedHeight(64)
+        mode_card.layout().addWidget(self.extra_goal)
+        root.addWidget(mode_card)
+
+        # ---- run + progress -----------------------------------------------
+        run_row = QHBoxLayout()
+        self.run_btn = h.primary_button("▶ 开始分析")
+        self.run_btn.setMinimumHeight(46)
+        self.run_btn.clicked.connect(self._on_run)
+        self.cancel_btn = h.danger_button("取消")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._on_cancel)
+        run_row.addWidget(self.run_btn, 1)
+        run_row.addWidget(self.cancel_btn)
+        root.addLayout(run_row)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(True)
+        self.progress.setFormat("%p%  %v / %m")
+        root.addWidget(self.progress)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(2000)
+        self.log.setPlaceholderText("运行日志会显示在这里…")
+        self.log.setMinimumHeight(120)
+        root.addWidget(self.log, 1)
+
+    def _mode_button_qss(self) -> str:
+        # Updated dynamically by _restyle_mode_buttons; keep base style here.
+        return """
+            QPushButton {
+                background: white;
+                color: #374151;
+                border: 1px solid #E5E7EB;
+                border-radius: 12px;
+                padding: 12px;
+                text-align: left;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                border-color: #5B6CFF;
+                color: #5B6CFF;
+            }
+            QPushButton:checked {
+                background: #5B6CFF;
+                color: white;
+                border: none;
+                font-weight: 600;
+            }
+        """
+
+    def _restyle_mode_buttons(self) -> None:
+        for b in self._mode_buttons.values():
+            b.style().unpolish(b)
+            b.style().polish(b)
+
+    def _selected_mode(self) -> str:
+        for k, b in self._mode_buttons.items():
+            if b.isChecked():
+                return k
+        return "row_by_row"
+
+    # ---- pickers ---------------------------------------------------------
+    def refresh_pickers(self) -> None:
+        cur_p = self.state.selected_preset()
+        cur_m = self.state.selected_model()
+        self.preset_picker.blockSignals(True)
+        self.model_picker.blockSignals(True)
+        self.preset_picker.clear()
+        self.model_picker.clear()
+        for p in self.state.presets.list():
+            self.preset_picker.addItem(f"{p.name} · {p.model}", p.id)
+        for m in self.state.models.list():
+            self.model_picker.addItem(f"{m.name} · {len(m.output_fields)} 字段", m.id)
+        if cur_p:
+            i = self.preset_picker.findData(cur_p.id)
+            if i >= 0:
+                self.preset_picker.setCurrentIndex(i)
+        if cur_m:
+            i = self.model_picker.findData(cur_m.id)
+            if i >= 0:
+                self.model_picker.setCurrentIndex(i)
+        self.preset_picker.blockSignals(False)
+        self.model_picker.blockSignals(False)
+        self._on_pickers_changed()
+
+    def _on_pickers_changed(self) -> None:
+        pid = self.preset_picker.currentData()
+        mid = self.model_picker.currentData()
+        if pid:
+            self.state.settings.update(last_preset_id=pid)
+            p = self.state.presets.get(pid)
+            self.preset_meta.setText(
+                f"{p.base_url}  ·  并发 {p.max_concurrency}  ·  最大 tokens {p.max_tokens}"
+                if p
+                else ""
+            )
+        if mid:
+            self.state.settings.update(last_model_id=mid)
+            m = self.state.models.get(mid)
+            self.model_meta.setText(
+                f"模板：{m.system_template}  ·  目标：{(m.analysis_goal or '—')[:40]}"
+                if m
+                else ""
+            )
+
+    # ---- data ------------------------------------------------------------
+    def _on_upload(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择数据 Excel", "", "Excel 文件 (*.xlsx *.xlsm)"
+        )
+        if not path:
+            return
+        try:
+            tbl = read_excel(path)
+        except Exception as e:  # noqa: BLE001
+            h.toast(self.window(), f"读取失败：{e}", "danger")
+            return
+        self._data = tbl
+        self.data_meta.setText(
+            f"已加载：{Path(path).name} · sheet={tbl.sheet_name} · "
+            f"{len(tbl.rows)} 行 × {len(tbl.columns)} 列"
+        )
+        self._fill_preview(tbl)
+
+    def _fill_preview(self, tbl: ExcelTable) -> None:
+        cols = tbl.columns
+        rows = tbl.head(5)
+        self.data_preview.setColumnCount(len(cols))
+        self.data_preview.setHorizontalHeaderLabels(cols)
+        self.data_preview.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            for j, c in enumerate(cols):
+                v = r.get(c)
+                self.data_preview.setItem(i, j, QTableWidgetItem("" if v is None else str(v)))
+
+    # ---- run -------------------------------------------------------------
+    def _append_log(self, line: str) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log.appendPlainText(f"[{ts}] {line}")
+
+    @qasync.asyncSlot()
+    async def _on_run(self) -> None:
+        pid = self.preset_picker.currentData()
+        mid = self.model_picker.currentData()
+        if not pid or not mid:
+            h.toast(self.window(), "请先选择 LLM 配置与分析模型", "warning")
+            return
+        if not self._data or not self._data.rows:
+            h.toast(self.window(), "请上传数据 Excel", "warning")
+            return
+        preset = self.state.presets.get(pid)
+        model = self.state.models.get(mid)
+        if not preset or not model:
+            h.toast(self.window(), "配置或模型已不存在", "danger")
+            return
+        api_key = self.state.get_api_key(preset)
+        if not api_key:
+            h.toast(self.window(), "API key 为空，请到配置页填写并保存", "danger")
+            return
+        if not model.output_fields:
+            h.toast(self.window(), "模型未定义任何输出字段", "warning")
+            return
+
+        if self.extra_goal.toPlainText().strip():
+            model = model.model_copy(update={"analysis_goal": self.extra_goal.toPlainText().strip()})
+
+        mode = self._selected_mode()
+        total = len(self._data.rows)
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(0)
+        self.run_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self._cancel_event = asyncio.Event()
+
+        self._append_log(f"开始：{total} 行，模式 {mode}，并发 {preset.max_concurrency}")
+
+        runner = AnalysisRunner(preset=preset, api_key=api_key, model=model)
+
+        def on_progress(p: RunProgress) -> None:
+            self.progress.setValue(p.completed)
+            if p.last_error:
+                self._append_log(f"行 {p.last_index} 失败：{p.last_error[:120]}")
+            else:
+                self._append_log(
+                    f"行 {p.last_index} 完成 ({p.last_duration_ms} ms, "
+                    f"tokens {p.prompt_tokens_total}+{p.completion_tokens_total})"
+                )
+
+        try:
+            result = await runner.run(
+                columns=self._data.columns,
+                rows=self._data.rows,
+                mode=mode,  # type: ignore[arg-type]
+                on_progress=on_progress,
+                cancel_event=self._cancel_event,
+            )
+        except Exception as e:  # noqa: BLE001
+            self._append_log(f"运行异常：{e}")
+            h.toast(self.window(), f"运行异常：{e}", "danger")
+            self.run_btn.setEnabled(True)
+            self.cancel_btn.setEnabled(False)
+            return
+
+        self._append_log(
+            f"完成：成功 {sum(1 for o, e in zip(result.row_outputs, result.row_errors) if o and not e)} "
+            f"/ 失败 {sum(1 for e in result.row_errors if e)} "
+            f"/ {result.duration_ms_total} ms / tokens {result.prompt_tokens_total}+{result.completion_tokens_total}"
+        )
+        self.state.last_run = result
+        self.run_completed.emit(result)
+        self.run_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+
+        # default save next to source
+        try:
+            src = Path(self._data.source_path)
+            out_path = src.with_name(f"{src.stem}_分析结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+            write_results(
+                output_path=out_path,
+                input_columns=self._data.columns,
+                rows=self._data.rows,
+                output_fields=model.output_fields,
+                row_outputs=result.row_outputs,
+                row_errors=result.row_errors,
+                summary_markdown=result.summary_markdown,
+                meta={
+                    "preset": preset.name,
+                    "model": preset.model,
+                    "analysis_model": model.name,
+                    "mode": mode,
+                    "duration_ms": result.duration_ms_total,
+                },
+            )
+            self._append_log(f"已写入结果文件：{out_path}")
+            h.toast(self.window(), f"已生成结果 Excel：{out_path.name}", "success")
+        except Exception as e:  # noqa: BLE001
+            self._append_log(f"写出 Excel 失败：{e}")
+            h.toast(self.window(), f"写出 Excel 失败：{e}", "danger")
+
+    def _on_cancel(self) -> None:
+        if self._cancel_event:
+            self._cancel_event.set()
+            self._append_log("已请求取消，等待进行中的任务结束…")
