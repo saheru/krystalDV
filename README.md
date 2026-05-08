@@ -4,6 +4,35 @@ Windows 平台基于 LLM 的 Excel 数据分析工具。
 
 > **给最终用户**：解压 `kdv.zip` → 双击 `kdv.exe`。无需安装 Python、无需终端、无需服务器。
 
+## 技术栈
+
+| 层 | 选型 | 作用 |
+| --- | --- | --- |
+| 运行时 | Python 3.11+ | 主语言 |
+| GUI | [PySide6](https://doc.qt.io/qtforpython-6/) (Qt 6) | 原生 Windows 桌面界面 |
+| 异步桥接 | [qasync](https://github.com/CabbageDevelopment/qasync) | asyncio 与 Qt 事件循环协同 |
+| HTTP 客户端 | [httpx](https://www.python-httpx.org/) | 异步调用 OpenAI 兼容接口 |
+| 重试 | [tenacity](https://tenacity.readthedocs.io/) | 指数退避，处理 429 / 5xx |
+| 数据校验 | [pydantic v2](https://docs.pydantic.dev/) | 配置 / 模型 / 输出结构化校验 |
+| Excel I/O | [openpyxl](https://openpyxl.readthedocs.io/) | 读写 .xlsx，含样式与多 sheet |
+| 数据计算 | [numpy](https://numpy.org/) + [pandas](https://pandas.pydata.org/) | 列统计、相关性矩阵、时序聚合 |
+| 交互图表 | [PyQtGraph](https://www.pyqtgraph.org/) | 柱/折/面积/散点/直方/箱线图（高性能） |
+| 静态图表 | [Matplotlib](https://matplotlib.org/) | 饼/环/雷达/相关性热力/树状/词云 |
+| 词云（可选） | [wordcloud](https://github.com/amueller/word_cloud) | 文本字段词云（缺失时回退为标签云） |
+| Markdown 渲染 | [markdown](https://python-markdown.github.io/) | 整表汇总洞察渲染 |
+| 凭据存储 | [keyring](https://github.com/jaraco/keyring) | API key 存到 Windows 凭据管理器 |
+| 路径定位 | [platformdirs](https://github.com/platformdirs/platformdirs) | 跨平台 AppData / Cache 路径 |
+| 系统主题 | [darkdetect](https://github.com/albertosottile/darkdetect) | 检测系统浅深色（保留扩展位） |
+| 图标字体 | [QtAwesome](https://github.com/spyder-ide/qtawesome) | 矢量图标 |
+| 测试 | pytest + pytest-asyncio | 单元测试 |
+| 打包 | [PyInstaller](https://pyinstaller.org/) (onefolder, `--windowed`) | 打成无终端、双击启动的 Windows 可执行 |
+
+**架构特点**：
+
+- 全异步：UI 主线程跑 Qt 事件循环，LLM 调用/Excel 读写都走 asyncio；并发数可配。
+- 单文件分发：onefolder 模式产出 `dist/kdv/` 整个目录，最终用户解压即用，**无需安装 Python**。
+- 数据零外发：所有 Excel 处理与缓存都在用户本地完成，仅 LLM 请求体走出网络。
+
 ## 功能亮点
 
 - **OpenAI 兼容 API**：支持 OpenAI / DeepSeek / 智谱 / Moonshot / Azure 等所有走 `/v1/chat/completions` 的服务
