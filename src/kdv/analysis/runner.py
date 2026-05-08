@@ -401,6 +401,44 @@ class AnalysisRunner:
                 cache.close()
 
     # ------------------------------------------------------------------
+    async def _summary_chat_with_retry(
+        self,
+        client: LLMClient,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+    ) -> Any:
+        """One summary chat call wrapped in an extra retry loop.
+
+        Each underlying `client.chat()` already retries `preset.max_retries`
+        times on RetryableLLMError. Summary calls are expensive single shots,
+        so we wrap that in *another* retry layer (5 outer attempts × inner
+        attempts = much more forgiving) for transient SSL/network blips.
+        """
+        last_err: Exception | None = None
+        outer_attempts = 5
+        for attempt in range(1, outer_attempts + 1):
+            try:
+                return await client.chat(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    schema_fields=None,
+                    max_tokens=max_tokens,
+                )
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                logger.warning(
+                    "summary attempt %d/%d failed: %s; retrying after backoff",
+                    attempt, outer_attempts, e,
+                )
+                # Exponential backoff: 2s, 4s, 8s, 16s — caps the run extension
+                # to ~30 extra seconds before giving up.
+                if attempt < outer_attempts:
+                    await asyncio.sleep(min(2 ** attempt, 16))
+        # All attempts failed — bubble up the last error
+        raise last_err if last_err else RuntimeError("summary failed without exception")
+
     async def _run_summary_with_chunking(
         self,
         *,
@@ -428,10 +466,10 @@ class AnalysisRunner:
                 use_function_calling=False,
                 sample_limit=len(chunks[0]),
             )
-            resp = await client.chat(
+            resp = await self._summary_chat_with_retry(
+                client,
                 system_prompt=sys_p,
                 user_prompt=user_p,
-                schema_fields=None,
                 max_tokens=summary_max_tokens,
             )
             return resp.text or "", resp.prompt_tokens, resp.completion_tokens
@@ -460,10 +498,10 @@ class AnalysisRunner:
                 use_function_calling=False,
                 sample_limit=len(chunk),
             )
-            resp = await client.chat(
+            resp = await self._summary_chat_with_retry(
+                client,
                 system_prompt=sys_p,
                 user_prompt=user_p,
-                schema_fields=None,
                 max_tokens=min(2048, summary_max_tokens),
             )
             partial_summaries.append(resp.text or "")
@@ -482,10 +520,10 @@ class AnalysisRunner:
         )
         if self._analysis_goal():
             reduce_sys += f"\n\n分析目标：{self._analysis_goal()}"
-        resp = await client.chat(
+        resp = await self._summary_chat_with_retry(
+            client,
             system_prompt=reduce_sys,
             user_prompt=joined,
-            schema_fields=None,
             max_tokens=summary_max_tokens,
         )
         total_pt += resp.prompt_tokens
