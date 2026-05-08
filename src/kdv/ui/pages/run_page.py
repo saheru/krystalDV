@@ -29,7 +29,7 @@ from kdv.analysis.runner import AnalysisRunner, RunProgress
 from kdv.excel.reader import ExcelTable, read_excel
 from kdv.excel.writer import write_results
 from kdv.ui import helpers as h
-from kdv.ui.animations import fade_in
+from kdv.ui.animations import animate_int_value, reveal_height, shake
 from kdv.ui.state import AppState
 
 
@@ -48,10 +48,11 @@ class RunPage(QWidget):
     # ---- layout ----------------------------------------------------------
     def _build(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 20, 24, 20)
-        root.setSpacing(16)
+        root.setContentsMargins(28, 24, 28, 24)
+        root.setSpacing(20)
 
         head = QHBoxLayout()
+        head.setSpacing(12)
         head.addWidget(h.heading("运行分析", level=1))
         head.addStretch(1)
         quick_btn = h.ghost_button("⚡ 无模型快速分析")
@@ -59,26 +60,35 @@ class RunPage(QWidget):
         quick_btn.clicked.connect(self._switch_to_quick_mode)
         head.addWidget(quick_btn)
         root.addLayout(head)
-        root.addWidget(
-            h.muted(
-                "选择 LLM 配置 + 数据 Excel 即可分析。模型可选——选『（无模型）』将跳过逐行结构化输出，"
-                "直接生成整表 Markdown 洞察。"
-            )
+        intro = h.muted(
+            "选择 LLM 配置 + 数据 Excel 即可分析。模型可选——选『（无模型）』将跳过逐行结构化输出，"
+            "直接生成整表 Markdown 洞察。"
         )
+        intro.setWordWrap(True)
+        root.addWidget(intro)
 
-        # ---- pickers row ------------------------------------------------
+        # ---- pickers row (two equal-width cards) ----------------------
         pickers = QHBoxLayout()
+        pickers.setSpacing(16)
 
         preset_card = h.make_card()
-        preset_card.layout().addWidget(h.heading("LLM 配置", level=3))
+        preset_card.setMinimumHeight(170)
+        ph = QHBoxLayout()
+        ph.setContentsMargins(0, 0, 0, 0)
+        ph.addWidget(h.heading("LLM 配置", level=3))
+        ph.addStretch(1)
+        preset_card.layout().addLayout(ph)
         self.preset_picker = QComboBox()
+        self.preset_picker.setMinimumHeight(36)
         self.preset_picker.currentIndexChanged.connect(self._on_pickers_changed)
         preset_card.layout().addWidget(self.preset_picker)
         self.preset_meta = h.muted("")
+        self.preset_meta.setWordWrap(True)
         preset_card.layout().addWidget(self.preset_meta)
-        pickers.addWidget(preset_card)
+        preset_card.layout().addStretch(1)
 
         model_card = h.make_card()
+        model_card.setMinimumHeight(170)
         mh = QHBoxLayout()
         mh.setContentsMargins(0, 0, 0, 0)
         mh.addWidget(h.heading("分析模型", level=3))
@@ -86,13 +96,16 @@ class RunPage(QWidget):
         mh.addWidget(h.badge("可选", "info"))
         model_card.layout().addLayout(mh)
         self.model_picker = QComboBox()
+        self.model_picker.setMinimumHeight(36)
         self.model_picker.currentIndexChanged.connect(self._on_pickers_changed)
         model_card.layout().addWidget(self.model_picker)
         self.model_meta = h.muted("")
         self.model_meta.setWordWrap(True)
         model_card.layout().addWidget(self.model_meta)
-        pickers.addWidget(model_card)
+        model_card.layout().addStretch(1)
 
+        pickers.addWidget(preset_card, 1)
+        pickers.addWidget(model_card, 1)
         root.addLayout(pickers)
 
         # ---- data card --------------------------------------------------
@@ -170,26 +183,36 @@ class RunPage(QWidget):
         root.addWidget(self.log, 1)
 
     def _mode_button_qss(self) -> str:
-        # Updated dynamically by _restyle_mode_buttons; keep base style here.
         return """
             QPushButton {
                 background: white;
                 color: #374151;
-                border: 1px solid #E5E7EB;
+                border: 1.5px solid #E5E7EB;
                 border-radius: 12px;
-                padding: 12px;
+                padding: 14px 16px;
                 text-align: left;
                 font-weight: 500;
+                min-height: 56px;
             }
             QPushButton:hover {
                 border-color: #5B6CFF;
                 color: #5B6CFF;
+                background: #F8F9FF;
             }
             QPushButton:checked {
                 background: #5B6CFF;
                 color: white;
-                border: none;
+                border: 1.5px solid #5B6CFF;
                 font-weight: 600;
+            }
+            QPushButton:checked:hover {
+                background: #4F5DE8;
+                border-color: #4F5DE8;
+            }
+            QPushButton:disabled {
+                color: #9CA3AF;
+                background: #F9FAFB;
+                border-color: #E5E7EB;
             }
         """
 
@@ -319,9 +342,11 @@ class RunPage(QWidget):
         mid = self.model_picker.currentData()
         if not pid:
             h.toast(self.window(), "请先选择 LLM 配置", "warning")
+            shake(self.preset_picker)
             return
         if not self._data or not self._data.rows:
             h.toast(self.window(), "请上传数据 Excel", "warning")
+            shake(self.upload_btn)
             return
         preset = self.state.presets.get(pid)
         model = self.state.models.get(mid) if mid else None
@@ -369,7 +394,10 @@ class RunPage(QWidget):
         )
 
         def on_progress(p: RunProgress) -> None:
-            self.progress.setValue(p.completed)
+            # Smooth animated progress
+            cur = self.progress.value()
+            if p.completed != cur:
+                animate_int_value(self.progress, b"value", cur, p.completed, duration_ms=240)
             if p.last_error:
                 self._append_log(f"行 {p.last_index} 失败：{p.last_error[:120]}")
             else:

@@ -20,14 +20,14 @@ from PySide6.QtWidgets import (
 from kdv.ui import style
 
 
-def make_card(parent: QWidget | None = None, *, padding: int = 16, shadow: bool = False) -> QFrame:
-    """A rounded white container.
+def make_card(parent: QWidget | None = None, *, padding: int = 18, shadow: bool = False) -> QFrame:
+    """A rounded white container with hover-lift via QSS only.
 
-    The drop-shadow effect was removed: QWidget can hold only one
-    QGraphicsEffect at a time, and `fade_in` on parent widgets would
-    silently overwrite the shadow — leaving residual layout artefacts.
-    The QSS border on `QWidget[card="true"]` provides enough definition.
-    `shadow=` is kept for backward compatibility but defaults to False.
+    Drop-shadow is intentionally NOT added — Qt allows only one graphics
+    effect per widget, and a future fade animation on a parent would silently
+    clobber it. The QSS rule on `QWidget[card="true"]` already provides a
+    clean border + hover state.
+    `shadow=` is kept for backward compatibility but is a no-op.
     """
     f = QFrame(parent)
     f.setProperty("card", True)
@@ -42,10 +42,14 @@ def heading(text: str, *, level: int = 1) -> QLabel:
     lbl = QLabel(text)
     if level == 1:
         lbl.setProperty("h1", True)
+        lbl.setMinimumHeight(36)
     elif level == 2:
         lbl.setProperty("h2", True)
+        lbl.setMinimumHeight(28)
     else:
         lbl.setProperty("h3", True)
+        lbl.setMinimumHeight(22)
+    lbl.setContentsMargins(0, 2, 0, 2)
     return lbl
 
 

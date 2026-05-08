@@ -39,6 +39,7 @@ from kdv.export.docx_export import export_docx
 from kdv.export.pptx_export import export_pptx
 from kdv.ui import helpers as h
 from kdv.ui import style
+from kdv.ui.animations import count_up_label, reveal_height, stagger_reveal
 from kdv.ui.state import AppState
 from kdv.viz import charts as ch
 from kdv.viz.column_stats import summarize_columns
@@ -237,6 +238,22 @@ class ResultPage(QWidget):
         card.layout().setSpacing(4)
         card.layout().addWidget(v)
         card.layout().addWidget(l)
+        # If value is purely numeric (or % or comma-separated digits), animate count-up
+        try:
+            stripped = value.replace(",", "").rstrip("%").rstrip("s").rstrip(" ms").strip()
+            target = float(stripped)
+            unit = ""
+            if "%" in value:
+                unit = "%"
+            elif " ms" in value:
+                unit = " ms"
+            elif " s" in value and "ms" not in value:
+                unit = " s"
+            decimals = 1 if "." in stripped else 0
+            fmt = ("{:,." + str(decimals) + "f}") + unit
+            count_up_label(v, start=0, end=target, duration_ms=750, fmt=fmt)
+        except (ValueError, AttributeError):
+            pass
         return card
 
     # ---- charts ---------------------------------------------------------
@@ -258,6 +275,8 @@ class ResultPage(QWidget):
     def _add_chart_card_to_grid(self, card: QWidget) -> None:
         n = self._chart_grid.count()
         self._chart_grid.addWidget(card, n // 2, n % 2)
+        # Smooth height reveal — no graphics effect, no input issues
+        reveal_height(card, duration_ms=320)
 
     def _wrap_chart_card(self, title: str, rationale: str, body: QWidget) -> QWidget:
         card = h.make_card(padding=14)
@@ -444,6 +463,7 @@ class ResultPage(QWidget):
         wrapper_w.setLayout(wrapper)
         # Insert before the trailing stretch
         self._chat_messages_lay.insertWidget(self._chat_messages_lay.count() - 1, wrapper_w)
+        reveal_height(wrapper_w, duration_ms=200)
         # Auto-scroll to bottom
         from PySide6.QtCore import QTimer
 

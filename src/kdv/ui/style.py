@@ -50,6 +50,9 @@ QWidget[card="true"] {{
     border: 1px solid {BORDER};
     border-radius: 12px;
 }}
+QWidget[card="true"]:hover {{
+    border: 1px solid #C7CCFF;
+}}
 
 /* ====== Sidebar nav buttons ====== */
 QPushButton[navItem="true"] {{
@@ -82,15 +85,19 @@ QPushButton {{
     color: {TEXT};
     border: 1px solid {BORDER_STRONG};
     border-radius: 8px;
-    padding: 8px 16px;
+    padding: 9px 18px;
     font-size: 13px;
+    min-height: 22px;
 }}
 QPushButton:hover {{
     border-color: {PRIMARY};
     color: {PRIMARY};
+    background: {ACCENT_SOFT};
 }}
 QPushButton:pressed {{
-    background: #F3F4F6;
+    background: #E0E7FF;
+    padding-top: 10px;
+    padding-bottom: 8px;
 }}
 QPushButton:disabled {{
     color: {TEXT_SUBTLE};
@@ -102,13 +109,16 @@ QPushButton[primary="true"] {{
     color: white;
     border: none;
     font-weight: 600;
-    padding: 9px 22px;
+    padding: 10px 24px;
+    min-height: 22px;
 }}
 QPushButton[primary="true"]:hover {{
     background: {PRIMARY_HOVER};
 }}
 QPushButton[primary="true"]:pressed {{
     background: {PRIMARY_PRESS};
+    padding-top: 11px;
+    padding-bottom: 9px;
 }}
 QPushButton[primary="true"]:disabled {{
     background: #C7CCFF;
@@ -117,20 +127,30 @@ QPushButton[ghost="true"] {{
     background: transparent;
     border: none;
     color: {PRIMARY};
-    padding: 6px 8px;
+    padding: 7px 10px;
+    min-height: 18px;
 }}
 QPushButton[ghost="true"]:hover {{
     color: {PRIMARY_HOVER};
     background: {ACCENT_SOFT};
+    border-radius: 8px;
+}}
+QPushButton[ghost="true"]:pressed {{
+    background: #DCE3FF;
 }}
 QPushButton[danger="true"] {{
     background: white;
     color: {DANGER};
     border: 1px solid #FCA5A5;
+    padding: 9px 18px;
+    min-height: 22px;
 }}
 QPushButton[danger="true"]:hover {{
     background: #FEF2F2;
     border-color: {DANGER};
+}}
+QPushButton[danger="true"]:pressed {{
+    background: #FEE2E2;
 }}
 
 /* ====== Inputs ====== */
