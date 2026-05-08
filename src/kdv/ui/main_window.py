@@ -72,7 +72,10 @@ class MainWindow(QMainWindow):
 
         help_btn = h.ghost_button("帮助")
         help_btn.clicked.connect(self._show_help)
+        about_btn = h.ghost_button("关于")
+        about_btn.clicked.connect(self._show_about)
         tlay.addWidget(help_btn)
+        tlay.addWidget(about_btn)
 
         root.addWidget(topbar)
 
@@ -103,10 +106,19 @@ class MainWindow(QMainWindow):
             slay.addWidget(btn)
         slay.addStretch(1)
 
-        version_lbl = QLabel("v0.1.0")
-        version_lbl.setStyleSheet("color: #9CA3AF; font-size: 11px;")
-        version_lbl.setAlignment(Qt.AlignCenter)
-        slay.addWidget(version_lbl)
+        from kdv import __version__
+
+        credit = QLabel(
+            f"v{__version__}\n"
+            "Leah Yao 作品\n"
+            "鸣谢 Chris Chen"
+        )
+        credit.setStyleSheet(
+            "color: #9CA3AF; font-size: 11px; padding: 8px 6px; line-height: 1.6;"
+        )
+        credit.setAlignment(Qt.AlignCenter)
+        credit.setWordWrap(True)
+        slay.addWidget(credit)
 
         body.addWidget(sidebar)
 
@@ -161,6 +173,70 @@ class MainWindow(QMainWindow):
             "Ctrl+1/2/3/4 切换页面 · 在『LLM 配置』填入 Base URL 与 API Key 后开始",
             "info",
         )
+
+    def _show_about(self) -> None:
+        from kdv import __version__
+        from PySide6.QtWidgets import (
+            QDialog,
+            QHBoxLayout as _HBox,
+            QLabel as _Label,
+            QVBoxLayout as _VBox,
+        )
+        from kdv.ui import style as _st
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("关于 Krystal Data Vision")
+        dlg.setFixedSize(440, 360)
+        layout = _VBox(dlg)
+        layout.setContentsMargins(28, 28, 28, 24)
+        layout.setSpacing(14)
+
+        logo_row = _HBox()
+        logo = _Label("◆")
+        logo.setStyleSheet(f"color: {_st.PRIMARY}; font-size: 36px;")
+        logo_row.addWidget(logo)
+        title = _Label("Krystal Data Vision")
+        title.setStyleSheet("font-size: 22px; font-weight: 700; color: #111827;")
+        logo_row.addWidget(title)
+        logo_row.addStretch(1)
+        layout.addLayout(logo_row)
+
+        sub = _Label("LLM 驱动的 Excel 数据分析工具")
+        sub.setStyleSheet("color: #6B7280; font-size: 13px;")
+        layout.addWidget(sub)
+
+        line = _Label()
+        line.setFixedHeight(1)
+        line.setStyleSheet(f"background: {_st.BORDER};")
+        layout.addWidget(line)
+
+        info_lines = [
+            ("版本", f"v{__version__}"),
+            ("作品", "Leah Yao 作品"),
+            ("鸣谢", "Chris Chen"),
+            ("仓库", "github.com/saheru/krystalDV"),
+        ]
+        for k, v in info_lines:
+            row = _HBox()
+            row.setSpacing(12)
+            kl = _Label(k)
+            kl.setStyleSheet("color: #9CA3AF; font-size: 12px; min-width: 60px;")
+            kl.setFixedWidth(60)
+            vl = _Label(v)
+            vl.setStyleSheet("color: #1F2937; font-size: 13px; font-weight: 600;")
+            row.addWidget(kl)
+            row.addWidget(vl, 1)
+            layout.addLayout(row)
+
+        layout.addStretch(1)
+        close = h.primary_button("关闭")
+        close.clicked.connect(dlg.accept)
+        bottom = _HBox()
+        bottom.addStretch(1)
+        bottom.addWidget(close)
+        layout.addLayout(bottom)
+
+        dlg.exec()
 
     # ---- persist window size ---------------------------------------------
     def closeEvent(self, e) -> None:  # noqa: N802

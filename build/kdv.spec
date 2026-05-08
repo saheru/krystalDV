@@ -49,6 +49,15 @@ try:
     datas += collect_data_files("qtawesome")
 except Exception:
     pass
+# python-docx / python-pptx ship default templates as package data
+try:
+    datas += collect_data_files("docx")
+except Exception:
+    pass
+try:
+    datas += collect_data_files("pptx")
+except Exception:
+    pass
 
 # --- hidden imports -----------------------------------------------------
 hiddenimports = []
@@ -63,6 +72,13 @@ hiddenimports += [
     "keyring.backends.SecretService",
     "keyring.backends.fail",
     "keyring.backends.null",
+    "docx",
+    "docx.oxml.ns",
+    "pptx",
+    "pptx.util",
+    "pptx.enum.shapes",
+    "pptx.enum.text",
+    "pptx.dml.color",
 ]
 
 # --- excludes (trim size) -----------------------------------------------

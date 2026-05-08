@@ -34,6 +34,9 @@ from kdv.agent.session import AgentSession, SessionTurnResult
 from kdv.agent.tools import ChartSpec, Insight
 from kdv.agent.trace import TraceEvent
 from kdv.analysis.runner import RunResult
+from kdv.export.payload import ChartImage, ExportPayload, capture_widget_png
+from kdv.export.docx_export import export_docx
+from kdv.export.pptx_export import export_pptx
 from kdv.ui import helpers as h
 from kdv.ui import style
 from kdv.ui.state import AppState
@@ -52,7 +55,10 @@ class ResultPage(QWidget):
         self._chat_messages_lay: QVBoxLayout | None = None
         self._dynamic_charts: list[ChartSpec] = []
         self._dynamic_insights: list[Insight] = []
-        self._auto_chart_count = 0  # how many charts came from auto-recommender
+        self._auto_chart_count = 0
+        # (title, rationale, body_widget) for exporting
+        self._chart_records: list[tuple[str, str, QWidget]] = []
+        self._current_result: RunResult | None = None
         self._build_empty()
 
     # ---- empty placeholder ----------------------------------------------
@@ -97,10 +103,18 @@ class ResultPage(QWidget):
         self._dynamic_charts = []
         self._dynamic_insights = []
         self._auto_chart_count = 0
+        self._chart_records = []
+        self._current_result = result
 
         head = QHBoxLayout()
         head.addWidget(h.heading("分析结果", level=1))
         head.addStretch(1)
+        export_word_btn = h.ghost_button("📄 导出 Word")
+        export_word_btn.clicked.connect(self._on_export_word)
+        export_ppt_btn = h.ghost_button("📊 导出 PPT")
+        export_ppt_btn.clicked.connect(self._on_export_ppt)
+        head.addWidget(export_word_btn)
+        head.addWidget(export_ppt_btn)
         head.addWidget(h.muted(f"运行 ID: {result.run_id}"))
         self._main.addLayout(head)
 
@@ -257,6 +271,8 @@ class ResultPage(QWidget):
         body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         body.setMinimumHeight(280)
         card.layout().addWidget(body, 1)
+        # Remember for export
+        self._chart_records.append((title, rationale, body))
         return card
 
     def _build_chart_from_suggestion(
@@ -562,6 +578,113 @@ class ResultPage(QWidget):
     def _output_fields(self):
         m = self.state.selected_model()
         return m.output_fields if m else []
+
+    # ---- export -----------------------------------------------------------
+    def _build_export_payload(self) -> ExportPayload:
+        result = self._current_result
+        preset = self.state.selected_preset()
+        model = self.state.selected_model()
+
+        kpis: list[tuple[str, str]] = []
+        if result:
+            total = len(result.rows)
+            tokens = result.prompt_tokens_total + result.completion_tokens_total
+            has_per_row = any(o is not None for o in result.row_outputs)
+            if has_per_row:
+                success = sum(1 for o, e in zip(result.row_outputs, result.row_errors) if o and not e)
+                fail = total - success
+                avg_ms = result.duration_ms_total // max(total, 1)
+                rate = (success / total * 100) if total else 0
+                kpis = [
+                    ("总行数", str(total)),
+                    ("成功", str(success)),
+                    ("失败", str(fail)),
+                    ("成功率", f"{rate:.1f}%"),
+                    ("平均耗时", f"{avg_ms} ms"),
+                    ("Token 用量", f"{tokens:,}"),
+                ]
+            else:
+                kpis = [
+                    ("数据行数", str(total)),
+                    ("数据列数", str(len(result.columns))),
+                    ("耗时", f"{result.duration_ms_total // 1000} s"),
+                    ("Prompt tokens", f"{result.prompt_tokens_total:,}"),
+                    ("Completion tokens", f"{result.completion_tokens_total:,}"),
+                    ("分析模式", result.mode),
+                ]
+
+        # Capture every chart widget to PNG
+        charts: list[ChartImage] = []
+        for title, rationale, body in self._chart_records:
+            try:
+                png = capture_widget_png(body, scale=2.0)
+            except Exception:
+                png = b""
+            charts.append(ChartImage(title=title, rationale=rationale, png_bytes=png))
+
+        # Insights from session
+        insights: list[tuple[str, str, str]] = []
+        if self._session:
+            for ins in self._session.all_insights:
+                insights.append((ins.title, ins.body, ins.severity))
+
+        sample_cols = list(result.columns) if result else []
+        sample_rows = list(result.rows[:8]) if result else []
+
+        return ExportPayload(
+            title="Krystal Data Vision 分析报告",
+            subtitle=(model.name if model else "无模型 · 直接整表汇总"),
+            preset_name=(preset.name if preset else ""),
+            model_id=(preset.model if preset else ""),
+            analysis_model_name=(model.name if model else "—"),
+            mode=(result.mode if result else ""),
+            kpis=kpis,
+            summary_markdown=(result.summary_markdown if result else "") or "",
+            charts=charts,
+            sample_columns=sample_cols,
+            sample_rows=sample_rows,
+            insights=insights,
+        )
+
+    def _on_export_word(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+        from datetime import datetime as _dt
+
+        suggested = f"分析报告_{_dt.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出 Word", suggested, "Word 文档 (*.docx)"
+        )
+        if not path:
+            return
+        try:
+            payload = self._build_export_payload()
+            export_docx(payload, path)
+            h.toast(self.window(), f"已导出 Word：{path}", "success")
+        except Exception as e:  # noqa: BLE001
+            import logging
+
+            logging.exception("docx export failed")
+            h.toast(self.window(), f"Word 导出失败：{e}", "danger")
+
+    def _on_export_ppt(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+        from datetime import datetime as _dt
+
+        suggested = f"分析报告_{_dt.now().strftime('%Y%m%d_%H%M%S')}.pptx"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出 PPT", suggested, "PowerPoint 文档 (*.pptx)"
+        )
+        if not path:
+            return
+        try:
+            payload = self._build_export_payload()
+            export_pptx(payload, path)
+            h.toast(self.window(), f"已导出 PPT：{path}", "success")
+        except Exception as e:  # noqa: BLE001
+            import logging
+
+            logging.exception("pptx export failed")
+            h.toast(self.window(), f"PPT 导出失败：{e}", "danger")
 
 
 # ----------------------------------------------------------------------
