@@ -142,20 +142,34 @@ class ResultPage(QWidget):
         row.setSpacing(12)
 
         total = len(result.rows)
-        success = sum(1 for o, e in zip(result.row_outputs, result.row_errors) if o and not e)
-        fail = total - success
-        success_rate = (success / total * 100) if total else 0
-        avg_ms = result.duration_ms_total // max(total, 1)
+        has_per_row = any(o is not None for o in result.row_outputs)
         tokens = result.prompt_tokens_total + result.completion_tokens_total
+        cols = len(result.columns)
 
-        for label, value, accent in [
-            ("总行数", str(total), "#5B6CFF"),
-            ("成功", f"{success}", "#10B981"),
-            ("失败", f"{fail}", "#EF4444"),
-            ("成功率", f"{success_rate:.1f}%", "#5B6CFF"),
-            ("平均耗时", f"{avg_ms} ms", "#3B82F6"),
-            ("Token 用量", f"{tokens:,}", "#F59E0B"),
-        ]:
+        if has_per_row:
+            success = sum(1 for o, e in zip(result.row_outputs, result.row_errors) if o and not e)
+            fail = total - success
+            success_rate = (success / total * 100) if total else 0
+            avg_ms = result.duration_ms_total // max(total, 1)
+            kpis = [
+                ("总行数", str(total), "#5B6CFF"),
+                ("成功", f"{success}", "#10B981"),
+                ("失败", f"{fail}", "#EF4444"),
+                ("成功率", f"{success_rate:.1f}%", "#5B6CFF"),
+                ("平均耗时", f"{avg_ms} ms", "#3B82F6"),
+                ("Token 用量", f"{tokens:,}", "#F59E0B"),
+            ]
+        else:
+            # Ad-hoc / summary-only run — emphasise dataset shape and total cost.
+            kpis = [
+                ("数据行数", str(total), "#5B6CFF"),
+                ("数据列数", str(cols), "#3B82F6"),
+                ("耗时", f"{result.duration_ms_total // 1000} s", "#10B981"),
+                ("Prompt tokens", f"{result.prompt_tokens_total:,}", "#F59E0B"),
+                ("Completion tokens", f"{result.completion_tokens_total:,}", "#EC4899"),
+                ("分析模式", result.mode, "#8B5CF6"),
+            ]
+        for label, value, accent in kpis:
             row.addWidget(self._kpi_card(label, value, accent), 1)
         return wrap
 

@@ -66,20 +66,36 @@ class AnalysisRunner:
         *,
         preset: LLMPreset,
         api_key: str,
-        model: AnalysisModel,
+        model: AnalysisModel | None,
         column_map: dict[str, str] | None = None,
+        ad_hoc_goal: str = "",
     ) -> None:
-        """`column_map` maps input column name -> model input field name (kept for traceability)."""
+        """`model` can be None for ad-hoc summary-only analysis.
+
+        `ad_hoc_goal` is used when model is None to convey the user's question.
+        """
         self.preset = preset
         self.api_key = api_key
         self.model = model
         self.column_map = column_map or {}
+        self.ad_hoc_goal = ad_hoc_goal
 
     def _system_prompt(self) -> str:
+        if self.model is None:
+            return SYSTEM_TEMPLATES["general"]
         base = SYSTEM_TEMPLATES.get(self.model.system_template, SYSTEM_TEMPLATES["general"])
         if self.model.custom_system_prompt.strip():
             return f"{base}\n\n{self.model.custom_system_prompt.strip()}"
         return base
+
+    def _analysis_goal(self) -> str:
+        return (self.model.analysis_goal if self.model else "") or self.ad_hoc_goal
+
+    def _output_fields(self):
+        return self.model.output_fields if self.model else []
+
+    def _model_id(self) -> str:
+        return self.model.id if self.model else "ad_hoc"
 
     async def run(
         self,
@@ -96,13 +112,17 @@ class AnalysisRunner:
         owns_cache = cache is None
         cache = cache or RunCache()
 
+        # Ad-hoc analysis (no model) only supports summary mode.
+        if self.model is None and mode != "summary":
+            mode = "summary"
+
         loop = asyncio.get_event_loop()
         t_start = loop.time()
         try:
             cache.start_run(
                 run_id,
                 preset_id=self.preset.id,
-                model_id=self.model.id,
+                model_id=self._model_id(),
                 total_rows=len(rows),
                 mode=mode,
             )
@@ -133,8 +153,8 @@ class AnalysisRunner:
                                 }
                             sys_p, user_p = build_row_prompt(
                                 system_extra=self._system_prompt(),
-                                analysis_goal=self.model.analysis_goal,
-                                schema_fields=self.model.output_fields,
+                                analysis_goal=self._analysis_goal(),
+                                schema_fields=self._output_fields(),
                                 row=row,
                                 use_function_calling=(
                                     self.preset.structured_mode != "prompt"
@@ -143,7 +163,7 @@ class AnalysisRunner:
                             resp = await client.chat(
                                 system_prompt=sys_p,
                                 user_prompt=user_p,
-                                schema_fields=self.model.output_fields,
+                                schema_fields=self._output_fields(),
                             )
                             if resp.parsed is None:
                                 raise LLMError("LLM 未返回可解析的结构化结果")
@@ -218,8 +238,8 @@ class AnalysisRunner:
             if mode in ("summary", "both") and not cancelled:
                 merged_columns = list(columns)
                 merged_rows: list[dict[str, Any]] = []
-                if mode == "both":
-                    out_field_names = [f.name for f in self.model.output_fields]
+                out_field_names = [f.name for f in self._output_fields()]
+                if mode == "both" and out_field_names:
                     for col in out_field_names:
                         merged_columns.append(f"分析:{col}")
                     for i, row in enumerate(rows):
@@ -234,7 +254,7 @@ class AnalysisRunner:
                 async with LLMClient(self.preset, self.api_key) as client:
                     sys_p, user_p = build_summary_prompt(
                         system_extra=self._system_prompt(),
-                        analysis_goal=self.model.analysis_goal,
+                        analysis_goal=self._analysis_goal(),
                         columns=merged_columns,
                         rows=merged_rows,
                         output_fields=None,

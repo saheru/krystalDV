@@ -3,23 +3,64 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import logging.handlers
 import sys
+import traceback
 
 from PySide6.QtGui import QFontDatabase, QIcon
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
-from kdv.paths import assets_dir
+from kdv.paths import assets_dir, cache_dir
 from kdv.ui.main_window import MainWindow
 from kdv.ui.state import AppState
 from kdv.ui.style import apply_global_style
 
 
 def _configure_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    """Log to console (when available) AND to a rotating file in the cache dir.
+
+    Frozen GUI builds have no terminal, so the file log is the only way to
+    diagnose crashes after the fact. Path: <user_cache>/krystaldatavision/kdv.log
+    """
+    log_path = cache_dir() / "kdv.log"
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    # Clear any existing handlers (avoid duplicates on hot-reload)
+    root.handlers.clear()
+    fh = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=2_000_000, backupCount=2, encoding="utf-8"
+    )
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
+    # Keep stderr handler too — useful in dev mode
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+    logging.info("=== Krystal Data Vision starting; log file: %s ===", log_path)
+
+
+def _install_excepthook() -> None:
+    """Log uncaught exceptions instead of letting them silently crash."""
+
+    def hook(exc_type, exc, tb):
+        logging.critical(
+            "Uncaught exception:\n%s",
+            "".join(traceback.format_exception(exc_type, exc, tb)),
+        )
+        try:
+            QMessageBox.critical(
+                None,
+                "应用错误",
+                f"发生未处理异常：\n\n{exc}\n\n详情已写入日志文件。",
+            )
+        except Exception:
+            pass
+
+    sys.excepthook = hook
 
 
 def _maybe_load_bundled_font() -> None:
@@ -35,6 +76,7 @@ def _maybe_load_bundled_font() -> None:
 
 def main() -> int:
     _configure_logging()
+    _install_excepthook()
 
     import qasync  # imported here to avoid surprising the user pre-install
 

@@ -53,8 +53,17 @@ class RunPage(QWidget):
         head = QHBoxLayout()
         head.addWidget(h.heading("运行分析", level=1))
         head.addStretch(1)
+        quick_btn = h.ghost_button("⚡ 无模型快速分析")
+        quick_btn.setToolTip("跳过模型，直接对数据 Excel 做整表汇总分析")
+        quick_btn.clicked.connect(self._switch_to_quick_mode)
+        head.addWidget(quick_btn)
         root.addLayout(head)
-        root.addWidget(h.muted("选择 LLM 配置 + 分析模型 + 数据 Excel，配置分析模式并启动。"))
+        root.addWidget(
+            h.muted(
+                "选择 LLM 配置 + 数据 Excel 即可分析。模型可选——选『（无模型）』将跳过逐行结构化输出，"
+                "直接生成整表 Markdown 洞察。"
+            )
+        )
 
         # ---- pickers row ------------------------------------------------
         pickers = QHBoxLayout()
@@ -69,11 +78,17 @@ class RunPage(QWidget):
         pickers.addWidget(preset_card)
 
         model_card = h.make_card()
-        model_card.layout().addWidget(h.heading("分析模型", level=3))
+        mh = QHBoxLayout()
+        mh.setContentsMargins(0, 0, 0, 0)
+        mh.addWidget(h.heading("分析模型", level=3))
+        mh.addStretch(1)
+        mh.addWidget(h.badge("可选", "info"))
+        model_card.layout().addLayout(mh)
         self.model_picker = QComboBox()
         self.model_picker.currentIndexChanged.connect(self._on_pickers_changed)
         model_card.layout().addWidget(self.model_picker)
         self.model_meta = h.muted("")
+        self.model_meta.setWordWrap(True)
         model_card.layout().addWidget(self.model_meta)
         pickers.addWidget(model_card)
 
@@ -198,6 +213,8 @@ class RunPage(QWidget):
         self.model_picker.clear()
         for p in self.state.presets.list():
             self.preset_picker.addItem(f"{p.name} · {p.model}", p.id)
+        # First slot in model picker = "无模型" (ad-hoc summary-only).
+        self.model_picker.addItem("（无模型 · 直接整表汇总分析）", "")
         for m in self.state.models.list():
             self.model_picker.addItem(f"{m.name} · {len(m.output_fields)} 字段", m.id)
         if cur_p:
@@ -231,6 +248,26 @@ class RunPage(QWidget):
                 if m
                 else ""
             )
+        else:
+            self.state.settings.update(last_model_id="")
+            self.model_meta.setText(
+                "无模型快速分析：跳过逐行结构化输出，整表一次性给出 Markdown 洞察。"
+            )
+
+        # When no model, only summary mode is sensible — disable the others.
+        no_model = not mid
+        if no_model:
+            for key in ("row_by_row", "both"):
+                btn = self._mode_buttons.get(key)
+                if btn:
+                    btn.setEnabled(False)
+                    if btn.isChecked():
+                        btn.setChecked(False)
+            self._mode_buttons["summary"].setEnabled(True)
+            self._mode_buttons["summary"].setChecked(True)
+        else:
+            for btn in self._mode_buttons.values():
+                btn.setEnabled(True)
 
     # ---- data ------------------------------------------------------------
     def _on_upload(self) -> None:
@@ -267,33 +304,53 @@ class RunPage(QWidget):
         ts = datetime.now().strftime("%H:%M:%S")
         self.log.appendPlainText(f"[{ts}] {line}")
 
+    def _switch_to_quick_mode(self) -> None:
+        """Set the picker to ad-hoc mode and focus the goal box."""
+        idx = self.model_picker.findData("")
+        if idx >= 0:
+            self.model_picker.setCurrentIndex(idx)
+        self.extra_goal.setFocus()
+        h.toast(self.window(), "已切换到无模型快速分析。请填写分析目标，然后上传数据 Excel。", "info")
+
     @qasync.asyncSlot()
     async def _on_run(self) -> None:
         pid = self.preset_picker.currentData()
         mid = self.model_picker.currentData()
-        if not pid or not mid:
-            h.toast(self.window(), "请先选择 LLM 配置与分析模型", "warning")
+        if not pid:
+            h.toast(self.window(), "请先选择 LLM 配置", "warning")
             return
         if not self._data or not self._data.rows:
             h.toast(self.window(), "请上传数据 Excel", "warning")
             return
         preset = self.state.presets.get(pid)
-        model = self.state.models.get(mid)
-        if not preset or not model:
-            h.toast(self.window(), "配置或模型已不存在", "danger")
+        model = self.state.models.get(mid) if mid else None
+        if not preset:
+            h.toast(self.window(), "LLM 配置已不存在", "danger")
             return
         api_key = self.state.get_api_key(preset)
         if not api_key:
             h.toast(self.window(), "API key 为空，请到配置页填写并保存", "danger")
             return
-        if not model.output_fields:
+        if model is not None and not model.output_fields:
             h.toast(self.window(), "模型未定义任何输出字段", "warning")
             return
 
-        if self.extra_goal.toPlainText().strip():
+        ad_hoc_goal = ""
+        if model is not None and self.extra_goal.toPlainText().strip():
             model = model.model_copy(update={"analysis_goal": self.extra_goal.toPlainText().strip()})
+        elif model is None:
+            ad_hoc_goal = self.extra_goal.toPlainText().strip()
+            if not ad_hoc_goal:
+                h.toast(
+                    self.window(),
+                    "无模型分析需要填写一个『分析目标』描述你希望 LLM 关注什么。",
+                    "warning",
+                )
+                return
 
         mode = self._selected_mode()
+        if model is None and mode != "summary":
+            mode = "summary"
         total = len(self._data.rows)
         self.progress.setRange(0, max(1, total))
         self.progress.setValue(0)
@@ -303,7 +360,12 @@ class RunPage(QWidget):
 
         self._append_log(f"开始：{total} 行，模式 {mode}，并发 {preset.max_concurrency}")
 
-        runner = AnalysisRunner(preset=preset, api_key=api_key, model=model)
+        runner = AnalysisRunner(
+            preset=preset,
+            api_key=api_key,
+            model=model,
+            ad_hoc_goal=ad_hoc_goal,
+        )
 
         def on_progress(p: RunProgress) -> None:
             self.progress.setValue(p.completed)
@@ -348,14 +410,14 @@ class RunPage(QWidget):
                 output_path=out_path,
                 input_columns=self._data.columns,
                 rows=self._data.rows,
-                output_fields=model.output_fields,
+                output_fields=model.output_fields if model else [],
                 row_outputs=result.row_outputs,
                 row_errors=result.row_errors,
                 summary_markdown=result.summary_markdown,
                 meta={
                     "preset": preset.name,
                     "model": preset.model,
-                    "analysis_model": model.name,
+                    "analysis_model": model.name if model else "（无模型 · 整表汇总）",
                     "mode": mode,
                     "duration_ms": result.duration_ms_total,
                 },
