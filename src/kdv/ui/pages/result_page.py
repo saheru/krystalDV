@@ -315,7 +315,7 @@ class ResultPage(QWidget):
         try:
             return _build_chart_widget(s.kind, s.columns, s.params or {}, columns, rows, stats)
         except Exception:
-            return h._empty(f"图表 {s.kind} 渲染失败")  # type: ignore[attr-defined]
+            return _empty_chart_label(f"图表 {s.kind} 渲染失败")
 
     def _build_chart_from_spec(self, spec: ChartSpec) -> QWidget | None:
         try:
@@ -324,7 +324,7 @@ class ResultPage(QWidget):
                 self._merged_columns, self._merged_rows, self._stats,
             )
         except Exception:
-            return h._empty(f"图表 {spec.kind} 渲染失败")  # type: ignore[attr-defined]
+            return _empty_chart_label(f"图表 {spec.kind} 渲染失败")
 
     # ---- insights -------------------------------------------------------
     def _build_insights_panel(self, result: RunResult) -> QWidget:
@@ -741,6 +741,14 @@ th { background: #F9FAFB; }
 strong { color: #5B6CFF; }
 </style>
 """
+
+
+def _empty_chart_label(text: str) -> QWidget:
+    """Fallback widget shown when a chart fails to render."""
+    lbl = QLabel(text)
+    lbl.setAlignment(Qt.AlignCenter)
+    lbl.setStyleSheet("color:#9CA3AF; font-size:13px; padding:32px;")
+    return lbl
 
 
 def _merge_rows(result: RunResult) -> tuple[list[str], list[dict[str, Any]]]:
