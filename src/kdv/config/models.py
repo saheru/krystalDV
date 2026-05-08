@@ -29,7 +29,9 @@ class LLMPreset(BaseModel):
     # automatically lifts this to at least 4096 so long reports aren't truncated.
     max_tokens: int = 4096
     timeout_seconds: int = 60
-    max_concurrency: int = 5
+    # Most proxies/free tiers choke at >5 concurrent requests with empty 200s.
+    # Bump up only if you've validated the endpoint can take it.
+    max_concurrency: int = 3
     max_retries: int = 3
     structured_mode: Literal["auto", "function_calling", "prompt"] = "auto"
     extra_headers: dict[str, str] = Field(default_factory=dict)

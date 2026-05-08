@@ -49,6 +49,9 @@ class LLMClient:
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
+            # Some proxies default to text/event-stream when this is missing,
+            # which we then can't json.loads(). Be explicit.
+            "Accept": "application/json",
             **self.preset.extra_headers,
         }
         self._http = httpx.AsyncClient(
@@ -127,6 +130,7 @@ class LLMClient:
             ],
             "temperature": self.preset.temperature if temperature is None else temperature,
             "max_tokens": self.preset.max_tokens if max_tokens is None else max_tokens,
+            "stream": False,
         }
 
         mode = self.preset.structured_mode
@@ -164,12 +168,13 @@ class LLMClient:
             data = r.json()
         except (json.JSONDecodeError, ValueError) as e:
             raw = (r.text or "").strip()[:300] or "<empty body>"
-            # Empty / non-JSON response from the provider — most often a
-            # transient proxy hiccup. Treat as retryable so the wrapper
-            # backs off and tries again instead of dumping the raw
-            # JSONDecodeError into the per-row error column.
+            # Empty / non-JSON 200 response is almost always proxy
+            # overload from too many concurrent requests. Surface a hint.
+            hint = ""
+            if not raw or raw == "<empty body>":
+                hint = "（代理过载——建议把『并发』调到 3-5 再试）"
             raise RetryableLLMError(
-                f"响应不是 JSON（HTTP {r.status_code}）: {raw!r}"
+                f"响应不是 JSON（HTTP {r.status_code}）: {raw!r}{hint}"
             ) from e
         return _parse_chat_response(data, expect_tool=use_fc)
 
@@ -217,6 +222,7 @@ class LLMClient:
             "max_tokens": self.preset.max_tokens if max_tokens is None else max_tokens,
             "tools": tools,
             "tool_choice": tool_choice,
+            "stream": False,
         }
         try:
             r = await self._http.post("/chat/completions", json=body)
@@ -259,6 +265,7 @@ class LLMClient:
             ],
             "temperature": self.preset.temperature if temperature is None else temperature,
             "max_tokens": self.preset.max_tokens if max_tokens is None else max_tokens,
+            "stream": False,
         }
         try:
             r = await self._http.post("/chat/completions", json=body)
