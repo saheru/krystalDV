@@ -190,11 +190,20 @@ class AgentRunner:
 
                 ctx.add_user(f"# 任务 {task_idx + 1}/{len(tasks)}\n\n{task}\n\n请按工作流程开始。")
 
+                # Snapshot artifact counts before this task so the fallback
+                # summary can quote ONLY what this task produced (rather than
+                # leaking findings from earlier tasks in the same run).
+                insights_before = len(tool_ctx.insights)
+                charts_before = len(tool_ctx.charts)
+
                 steps_used, pt, ct, summary, abort_reason = await self._run_one_task(
                     client=client,
                     fast_client=fast_client,
                     ctx=ctx,
                     tool_ctx=tool_ctx,
+                    task_text=task,
+                    insights_before=insights_before,
+                    charts_before=charts_before,
                     emit=emit,
                     cancel_event=cancel_event,
                     async_summarizer=_summarize,
@@ -230,6 +239,9 @@ class AgentRunner:
         fast_client: LLMClient,
         ctx: ConversationContext,
         tool_ctx: ToolContext,
+        task_text: str,
+        insights_before: int,
+        charts_before: int,
         emit: Callable[[TraceEvent], None],
         cancel_event: asyncio.Event | None,
         async_summarizer: Callable[[str], Any],
@@ -382,20 +394,122 @@ class AgentRunner:
             )
 
         if not summary:
-            # Fall back to the MAIN (smarter) model for the final summary —
-            # this is the place where prose quality matters and is run once.
-            try:
-                resp = await client.chat(
-                    system_prompt="基于已收集的信息直接给出 Markdown 任务结论。",
-                    user_prompt="请用一段简短 Markdown 总结当前任务的发现。",
-                    schema_fields=None,
-                    max_tokens=800,
-                )
-                summary = resp.text.strip()
-            except Exception:
-                summary = "（未能生成有效总结）"
+            summary = await self._fallback_summary(
+                client=client,
+                ctx=ctx,
+                tool_ctx=tool_ctx,
+                task_text=task_text,
+                insights_before=insights_before,
+                charts_before=charts_before,
+                abort_reason=abort_reason,
+                emit=emit,
+            )
 
         return steps, prompt_tokens, completion_tokens, summary, abort_reason
+
+    async def _fallback_summary(
+        self,
+        *,
+        client: LLMClient,
+        ctx: ConversationContext,
+        tool_ctx: ToolContext,
+        task_text: str,
+        insights_before: int,
+        charts_before: int,
+        abort_reason: str,
+        emit: Callable[[TraceEvent], None],
+    ) -> str:
+        """Compose a final task summary when the agent didn't call finish_task.
+
+        The previous implementation called `client.chat()` with no context at
+        all — the LLM answered "我没有看到任何当前正在进行的任务" because
+        that was literally true from its point of view. We fix that by
+        feeding the task text + this task's insights/charts + the tail of the
+        actual conversation into the prompt, OR by returning a clear failure
+        message when nothing was produced.
+        """
+        new_insights = list(tool_ctx.insights[insights_before:])
+        new_charts = list(tool_ctx.charts[charts_before:])
+
+        # Pull the last few non-system turns that have *content* (tool results
+        # + assistant prose) so the summary call can actually see something
+        # concrete instead of just trusting the model's memory.
+        recent_chunks: list[str] = []
+        for m in reversed(ctx.messages):
+            if m.role == "system":
+                continue
+            if not (m.content or "").strip():
+                continue
+            tag = {"user": "用户", "assistant": "助手", "tool": f"工具[{m.name}]"}.get(m.role, m.role)
+            recent_chunks.append(f"### {tag}\n{m.content[:600]}")
+            if len(recent_chunks) >= 6:
+                break
+        recent_chunks.reverse()
+        recent_blob = "\n\n".join(recent_chunks) if recent_chunks else "（无）"
+
+        # If nothing happened at all, don't burn an LLM call on hallucinated
+        # prose — surface the real situation to the user.
+        no_progress = not new_insights and not new_charts and not recent_chunks
+        if no_progress:
+            reason_hint = ""
+            if abort_reason.startswith("llm_error"):
+                reason_hint = f"，原因：{abort_reason}"
+            elif abort_reason == "step_limit":
+                reason_hint = f"，已用满 {self.max_steps_per_task} 步预算但未产生任何工具结果"
+            elif abort_reason == "cancelled":
+                reason_hint = "，已被用户取消"
+            elif abort_reason:
+                reason_hint = f"，{abort_reason}"
+            return (
+                f"⚠ 本任务未能完成{reason_hint}。\n\n"
+                f"任务原文：{task_text}\n\n"
+                f"建议：检查 LLM 是否支持工具调用（function calling），或换一个支持的端点重试。"
+            )
+
+        # Otherwise, hand the model the concrete material it needs.
+        insight_lines = "\n".join(
+            f"- **{i.title or '(无标题)'}**：{i.body[:200]}" for i in new_insights
+        ) or "（本任务期间未记录 insight）"
+        chart_lines = "\n".join(
+            f"- {c.kind}：{c.title}（列：{', '.join(c.columns) or '—'}）"
+            for c in new_charts
+        ) or "（本任务期间未生成图表）"
+
+        user_prompt = (
+            f"# 本任务原文\n{task_text}\n\n"
+            f"# 已记录的洞察\n{insight_lines}\n\n"
+            f"# 已生成的图表\n{chart_lines}\n\n"
+            f"# 最近的对话/工具结果片段\n{recent_blob}\n\n"
+            f"---\n"
+            f"请基于以上**真实材料**用 Markdown 写一段 200 字内的任务结论"
+            f"（不要凭空臆造数据；若材料不足请直说『证据不足』）。"
+        )
+        try:
+            resp = await client.chat(
+                system_prompt=(
+                    "你是一名严谨的数据分析助手。下面用户会给你一份 agent 收集到的素材，"
+                    "请只基于这些素材撰写任务结论，不允许凭空补充数字或事实。"
+                ),
+                user_prompt=user_prompt,
+                schema_fields=None,
+                max_tokens=800,
+            )
+            text = (resp.text or "").strip()
+            if text:
+                return text
+        except Exception as e:  # noqa: BLE001
+            emit(TraceEvent(kind="error", text=f"兜底总结调用失败：{e}"))
+
+        # If the LLM call failed or returned nothing, build a deterministic
+        # summary from the artifacts so the user still gets *something*.
+        parts = [f"### 任务：{task_text}\n"]
+        if new_insights:
+            parts.append("**洞察**：\n" + insight_lines)
+        if new_charts:
+            parts.append("**图表**：\n" + chart_lines)
+        if not new_insights and not new_charts:
+            parts.append("（agent 已收集若干工具结果但未固化为 insight/chart）")
+        return "\n\n".join(parts)
 
     def _make_result(
         self,
