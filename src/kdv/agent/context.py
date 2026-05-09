@@ -114,30 +114,43 @@ class ConversationContext:
         return self.total_tokens() >= int(self.budget() * self.safety_margin)
 
     # ---- compaction -------------------------------------------------------
+    # Cap per-message detail in the compaction prompt; tool result tables
+    # past this length are tail-truncated (still useful for the summarizer).
+    _PER_MSG_CHAR_BUDGET = 1200
+    # Single-shot compaction prompt budget. Past this we chunk the middle
+    # so each LLM call stays small and fast — see `_compact_chunked_async`.
+    _SINGLE_SHOT_CHAR_BUDGET = 6000
+
+    _COMPACTION_INSTRUCTION = (
+        "下面是一段 agent 会话历史，请压缩成简洁要点（≤300字），保留：\n"
+        "1. 已经获得的关键事实/数据\n"
+        "2. 已尝试过的工具与重要观察\n"
+        "3. 待办或下一步计划\n\n"
+        "会话历史：\n\n"
+    )
+
+    def _format_message_for_compaction(self, m: Message) -> str:
+        tag = m.role.upper()
+        if m.role == "tool":
+            tag = f"TOOL[{m.name}]"
+        txt = m.content or ""
+        if m.tool_calls:
+            txt = txt + " | tool_calls=" + str(
+                [(tc.get("function", {}).get("name", "?"),
+                  tc.get("function", {}).get("arguments", "")[:120])
+                 for tc in m.tool_calls]
+            )
+        return f"[{tag}] {txt[:self._PER_MSG_CHAR_BUDGET]}"
+
+    def _format_middle_lines(self, middle: list[Message]) -> list[str]:
+        return [self._format_message_for_compaction(m) for m in middle]
+
     def _build_compaction_prompt(self) -> tuple[str, list[Message], list[Message], list[Message]]:
         head = self.messages[:1]
         keep = self.messages[-self.keep_recent:]
         middle = self.messages[1:-self.keep_recent]
-        joined = []
-        for m in middle:
-            tag = m.role.upper()
-            if m.role == "tool":
-                tag = f"TOOL[{m.name}]"
-            txt = m.content or ""
-            if m.tool_calls:
-                txt = txt + " | tool_calls=" + str(
-                    [(tc.get("function", {}).get("name", "?"),
-                      tc.get("function", {}).get("arguments", "")[:120])
-                     for tc in m.tool_calls]
-                )
-            joined.append(f"[{tag}] {txt[:1200]}")
-        prompt = (
-            "下面是一段 agent 会话历史，请压缩成简洁要点（≤300字），保留：\n"
-            "1. 已经获得的关键事实/数据\n"
-            "2. 已尝试过的工具与重要观察\n"
-            "3. 待办或下一步计划\n\n"
-            "会话历史：\n\n" + "\n\n".join(joined)
-        )
+        lines = self._format_middle_lines(middle)
+        prompt = self._COMPACTION_INSTRUCTION + "\n\n".join(lines)
         return prompt, head, middle, keep
 
     def _apply_compaction(self, head, middle, keep, summary: str) -> int:
@@ -154,24 +167,88 @@ class ConversationContext:
         )
         return len(middle)
 
+    @staticmethod
+    def _chunk_lines_by_char_budget(
+        lines: list[str], char_budget: int
+    ) -> list[list[str]]:
+        """Group consecutive formatted lines into chunks that each stay below
+        `char_budget` total chars (joined with double-newlines).
+
+        Each chunk preserves message order so per-chunk summaries read in the
+        same chronological flow as the original conversation.
+        """
+        chunks: list[list[str]] = []
+        cur: list[str] = []
+        cur_len = 0
+        sep = 2  # "\n\n"
+        for ln in lines:
+            ln_len = len(ln) + sep
+            if cur and cur_len + ln_len > char_budget:
+                chunks.append(cur)
+                cur = []
+                cur_len = 0
+            cur.append(ln)
+            cur_len += ln_len
+        if cur:
+            chunks.append(cur)
+        return chunks
+
     async def compact_async(self, async_summarizer) -> int:
         """Compact older messages via an async summarizer coroutine.
 
-        `async_summarizer` is an async callable taking a prompt string and
-        returning the summary. Use this from agent loops running on the same
-        event loop as the LLM call.
+        Single-shot when the middle joins to ≤ _SINGLE_SHOT_CHAR_BUDGET chars,
+        otherwise hierarchical: split middle into char-bounded chunks, summarize
+        each chunk separately (each LLM call stays small/fast → no timeout),
+        then concatenate the chunk summaries into the replacement system
+        message. No data is dropped — every chunk's numbers / observations
+        flow through into the final compacted summary.
+
+        Returns the number of original messages that were compacted (0 on
+        failure or when there's nothing to do).
         """
         if len(self.messages) <= 1 + self.keep_recent:
             return 0
-        prompt, head, middle, keep = self._build_compaction_prompt()
+        head = self.messages[:1]
+        keep = self.messages[-self.keep_recent:]
+        middle = self.messages[1:-self.keep_recent]
         if not middle:
             return 0
+        lines = self._format_middle_lines(middle)
+        joined_total = sum(len(ln) + 2 for ln in lines)
         try:
-            summary = await async_summarizer(prompt)
+            if joined_total <= self._SINGLE_SHOT_CHAR_BUDGET:
+                prompt = self._COMPACTION_INSTRUCTION + "\n\n".join(lines)
+                summary = await async_summarizer(prompt)
+            else:
+                summary = await self._summarize_chunked(lines, async_summarizer)
         except Exception:
             logger.exception("async compaction summarizer failed; keeping raw context")
             return 0
+        if not (summary or "").strip():
+            logger.warning("compaction returned empty summary; keeping raw context")
+            return 0
         return self._apply_compaction(head, middle, keep, summary)
+
+    async def _summarize_chunked(
+        self, lines: list[str], async_summarizer
+    ) -> str:
+        chunks = self._chunk_lines_by_char_budget(lines, self._SINGLE_SHOT_CHAR_BUDGET)
+        partial: list[str] = []
+        for i, chunk in enumerate(chunks, start=1):
+            prompt = (
+                f"以下是一段 agent 会话历史的第 {i}/{len(chunks)} 段。"
+                f"请用 ≤200 字提炼本段中：\n"
+                f"1. 关键数字 / 事实（具体数值原样保留）\n"
+                f"2. 调用过的工具及其结果要点\n"
+                f"3. 与下一步计划相关的线索\n\n"
+                f"片段内容：\n\n" + "\n\n".join(chunk)
+            )
+            piece = await async_summarizer(prompt)
+            partial.append(f"### 第 {i} 段\n{(piece or '').strip() or '(空)'}")
+        # No second-pass merge — concatenation already preserves all numbers
+        # the chunk summaries kept verbatim, and a merge call would re-introduce
+        # the long-prompt timeout risk we just engineered around.
+        return "\n\n".join(partial)
 
     def compact_with(self, summarizer) -> int:
         """Sync version (for tests / non-async contexts only)."""

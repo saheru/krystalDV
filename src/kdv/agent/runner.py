@@ -300,27 +300,40 @@ class AgentRunner:
 
             # ---- compact if needed --------------------------------------
             if ctx.needs_compaction():
-                emit(TraceEvent(kind="compaction",
-                                text=f"上下文 {ctx.total_tokens()} tokens 接近预算，压缩中…"))
-                # Try compaction with retries on transient errors. If it
-                # ultimately fails, just continue with un-compacted context
-                # — the next chat call may still succeed if the network
-                # blip clears up.
-                for cc_attempt in range(1, 4):
-                    try:
-                        await ctx.compact_async(async_summarizer)
-                        break
-                    except Exception as e:  # noqa: BLE001
-                        if cc_attempt == 3:
-                            logger.exception("compaction failed after retries")
-                            emit(TraceEvent(kind="error",
-                                            text=f"压缩失败（已重试 3 次）：{e}"))
-                            break
-                        emit(TraceEvent(
-                            kind="error",
-                            text=f"压缩失败重试中（第 {cc_attempt} 次）：{str(e)[:80]}",
-                        ))
-                        await asyncio.sleep(2 * cc_attempt)
+                tokens_before = ctx.total_tokens()
+                emit(TraceEvent(
+                    kind="compaction",
+                    text=f"上下文 {tokens_before} tokens 接近预算，压缩中…",
+                ))
+                # `compact_async` is hierarchical: small middles compact in
+                # one shot, big ones split into per-chunk LLM calls so each
+                # call stays small/fast. It swallows its own exceptions and
+                # returns 0 on full failure — we surface that here so the
+                # user sees the outcome instead of a silent gap.
+                compacted_n = 0
+                try:
+                    compacted_n = await ctx.compact_async(async_summarizer)
+                except Exception as e:  # noqa: BLE001 — defensive only
+                    logger.exception("compaction crashed unexpectedly")
+                    emit(TraceEvent(kind="error",
+                                    text=f"压缩异常：{str(e)[:120]}"))
+                if compacted_n > 0:
+                    tokens_after = ctx.total_tokens()
+                    emit(TraceEvent(
+                        kind="compaction",
+                        text=(
+                            f"压缩成功：{compacted_n} 条消息已合并，"
+                            f"上下文 {tokens_before} → {tokens_after} tokens"
+                        ),
+                    ))
+                else:
+                    emit(TraceEvent(
+                        kind="error",
+                        text=(
+                            "压缩未生效（保持原上下文）。"
+                            "若下面 LLM 调用持续超时，建议取消任务、缩小数据范围后重试。"
+                        ),
+                    ))
 
             # ---- LLM call (with extra outer retry for transient blips) -
             resp = None
@@ -524,31 +537,57 @@ class AgentRunner:
             f"请基于以上**真实材料**用 Markdown 写一段 200 字内的任务结论"
             f"（不要凭空臆造数据；若材料不足请直说『证据不足』）。"
         )
-        try:
-            resp = await client.chat(
-                system_prompt=(
-                    "你是一名严谨的数据分析助手。下面用户会给你一份 agent 收集到的素材，"
-                    "请只基于这些素材撰写任务结论，不允许凭空补充数字或事实。"
-                ),
-                user_prompt=user_prompt,
-                schema_fields=None,
-                max_tokens=800,
-            )
-            text = (resp.text or "").strip()
-            if text:
-                return text
-        except Exception as e:  # noqa: BLE001
-            emit(TraceEvent(kind="error", text=f"兜底总结调用失败：{e}"))
+        # Try the LLM up to 3 times with backoff before falling back to the
+        # mechanical summary. Single attempt was too easy to lose to a single
+        # transient timeout — the user complained that the task ended with
+        # nothing useful when the network blipped at exactly the wrong moment.
+        last_err: str = ""
+        for attempt in range(1, 4):
+            try:
+                resp = await client.chat(
+                    system_prompt=(
+                        "你是一名严谨的数据分析助手。下面用户会给你一份 agent 收集到的素材，"
+                        "请只基于这些素材撰写任务结论，不允许凭空补充数字或事实。"
+                    ),
+                    user_prompt=user_prompt,
+                    schema_fields=None,
+                    max_tokens=800,
+                )
+                text = (resp.text or "").strip()
+                if text:
+                    return text
+                # Empty response — treat as transient and retry.
+                last_err = "LLM 返回空内容"
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)[:120]
+                emit(TraceEvent(
+                    kind="error",
+                    text=f"兜底总结调用失败（第 {attempt}/3 次）：{last_err}",
+                ))
+            if attempt < 3:
+                await asyncio.sleep(min(2 ** attempt, 8))
 
-        # If the LLM call failed or returned nothing, build a deterministic
-        # summary from the artifacts so the user still gets *something*.
+        # All LLM attempts exhausted — assemble a deterministic Markdown
+        # summary from the actual artifacts so the user always gets a
+        # usable task output instead of a silent "task ended" with nothing
+        # to show. We keep raw tool numbers verbatim — that's the data the
+        # user paid for.
+        emit(TraceEvent(
+            kind="error",
+            text=f"兜底总结 LLM 全部失败（{last_err}），改用确定性摘要兜底（基于真实工具结果）。",
+        ))
         parts = [f"### 任务：{task_text}\n"]
+        parts.append(
+            f"_（说明：本任务结论由确定性摘要生成，因 LLM 总结调用持续失败：{last_err}）_"
+        )
         if new_insights:
             parts.append("**洞察**：\n" + insight_lines)
         if new_charts:
             parts.append("**图表**：\n" + chart_lines)
-        if not new_insights and not new_charts:
-            parts.append("（agent 已收集若干工具结果但未固化为 insight/chart）")
+        if recent_chunks:
+            parts.append("**近端工具结果（按时间序）**：\n" + recent_blob)
+        if not new_insights and not new_charts and not recent_chunks:
+            parts.append("（本任务未产生可见的工具结果或洞察。）")
         return "\n\n".join(parts)
 
     def _make_result(

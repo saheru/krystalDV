@@ -127,3 +127,73 @@ def test_context_compaction_replaces_middle():
     assert len(ctx.messages) <= 1 + 1 + 2
     assert "summary text" in ctx.messages[1].content
     assert n_before > len(ctx.messages)
+
+
+async def test_compact_async_chunks_huge_middle_into_multiple_calls():
+    """Big middles must be split into per-chunk LLM calls so each call stays
+    small/fast — without this guard the compaction prompt itself was as big
+    as the context being compacted, which is what made super-long tables
+    blow up with chained timeouts.
+    """
+    ctx = ConversationContext(
+        model="gpt-4o-mini",
+        max_context_tokens=2000,
+        output_reserve_tokens=400,
+        keep_recent=2,
+        safety_margin=0.5,
+    )
+    ctx.add_system("system")
+    # 10 messages × ~1200 chars each → middle joins to ~12k chars,
+    # well above the 6000-char single-shot budget → must be chunked.
+    big = "Z" * 1200
+    for i in range(5):
+        ctx.add_user(f"u{i} {big}")
+        ctx.add_assistant(f"a{i} {big}")
+
+    calls: list[str] = []
+
+    async def fake_summarizer(prompt: str) -> str:
+        calls.append(prompt)
+        # Every chunk gets a short summary mentioning its own index.
+        idx = len(calls)
+        return f"chunk-{idx}-summary"
+
+    n = await ctx.compact_async(fake_summarizer)
+    assert n > 0
+    # Multiple summarizer calls = chunked path (single-shot would be 1).
+    assert len(calls) >= 2, f"expected hierarchical chunking, got {len(calls)} call(s)"
+    # No single chunk prompt may exceed the budget (with some slack for the
+    # prefix instructions added per chunk).
+    for prompt in calls:
+        assert len(prompt) < 8000, f"chunk prompt too big: {len(prompt)} chars"
+    # All chunk summaries land in the synthesized middle message.
+    synth = ctx.messages[1]
+    assert synth.role == "system"
+    for i in range(1, len(calls) + 1):
+        assert f"chunk-{i}-summary" in synth.content
+
+
+async def test_compact_async_returns_zero_on_empty_summary():
+    """Empty summary must keep the context untouched — otherwise we'd
+    silently destroy the conversation and leave the agent unable to recover.
+    """
+    ctx = ConversationContext(
+        model="gpt-4o-mini",
+        max_context_tokens=2000,
+        output_reserve_tokens=400,
+        keep_recent=2,
+        safety_margin=0.5,
+    )
+    ctx.add_system("sys")
+    for i in range(6):
+        ctx.add_user(f"u{i} " + "X" * 200)
+        ctx.add_assistant(f"a{i} " + "Y" * 200)
+
+    msgs_before = list(ctx.messages)
+
+    async def empty_summarizer(_prompt: str) -> str:
+        return "   "  # whitespace counts as empty
+
+    n = await ctx.compact_async(empty_summarizer)
+    assert n == 0
+    assert ctx.messages == msgs_before
