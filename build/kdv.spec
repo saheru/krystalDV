@@ -42,6 +42,12 @@ if ASSETS.exists():
             rel = f.parent.relative_to(PROJECT_ROOT)
             datas.append((str(f), str(rel)))
 
+# httpx loads SSL certs from certifi via `certifi.where()` at AsyncClient
+# init. Without the cacert.pem bundled, the Windows .exe raises
+# `FileNotFoundError: [Errno 2] No such file or directory` the moment it
+# tries to talk to the LLM endpoint — which is what users see as
+# "测试失败：[Errno 2] No such file or directory" on the 测试连接 button.
+datas += collect_data_files("certifi")
 datas += collect_data_files("matplotlib")
 datas += collect_data_files("openpyxl")
 datas += collect_data_files("pyqtgraph")
@@ -62,11 +68,16 @@ except Exception:
 # --- hidden imports -----------------------------------------------------
 hiddenimports = []
 hiddenimports += collect_submodules("matplotlib.backends")
+# httpx / httpcore have lazy submodule loads (e.g. _config, _transports.default,
+# _api) that PyInstaller's static analysis misses — bundle them all to be safe.
+hiddenimports += collect_submodules("httpx")
+hiddenimports += collect_submodules("httpcore")
 hiddenimports += [
     "matplotlib.backends.backend_qtagg",
     "matplotlib.backends.backend_agg",
     "qasync",
     "darkdetect",
+    "certifi",
     "keyring.backends.Windows",
     "keyring.backends.macOS",
     "keyring.backends.SecretService",
