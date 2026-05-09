@@ -175,6 +175,14 @@ class MainWindow(QMainWindow):
             f"## 任务 {i + 1}：{ts['task']}\n\n{sanitize_task_summary(ts['task'], ts['summary'])}"
             for i, ts in enumerate(job.result.task_summaries)
         )
+        # Stash retry material for any task that fell back to deterministic
+        # summary — the result page exposes a "重试总结" button that
+        # re-issues the LLM call with these stored prompts. Preset + key go
+        # in too because the LLMClient needs an endpoint to call.
+        self.state.extra["agent_fallbacks"] = list(job.result.fallbacks)
+        self.state.extra["agent_task_summaries"] = list(job.result.task_summaries)
+        self.state.extra["agent_retry_preset"] = job.preset
+        self.state.extra["agent_retry_api_key"] = job.api_key
         rr = RunResult(
             run_id=job.id,
             mode="agent",  # type: ignore[arg-type]

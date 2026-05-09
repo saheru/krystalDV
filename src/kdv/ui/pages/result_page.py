@@ -121,6 +121,13 @@ class ResultPage(QWidget):
         # Prevent stale agent artefacts from previous renders polluting this view.
         agent_charts = self.state.extra.pop("agent_charts", None) or []
         agent_insights = self.state.extra.pop("agent_insights", None) or []
+        # Retry-summary material — pulled into instance attrs so the retry
+        # button can use them, and popped from state.extra so a non-agent
+        # project opened next won't inherit them.
+        self._agent_fallbacks = self.state.extra.pop("agent_fallbacks", None) or []
+        self._agent_task_summaries = self.state.extra.pop("agent_task_summaries", None) or []
+        self._agent_retry_preset = self.state.extra.pop("agent_retry_preset", None)
+        self._agent_retry_api_key = self.state.extra.pop("agent_retry_api_key", "") or ""
         if hasattr(self, "_floating_chat") and self._floating_chat is not None:
             try:
                 self._floating_chat.deleteLater()
@@ -330,7 +337,22 @@ class ResultPage(QWidget):
     # ---- insights -------------------------------------------------------
     def _build_insights_panel(self, result: RunResult) -> QWidget:
         card = h.make_card()
-        card.layout().addWidget(h.heading("整表汇总洞察", level=2))
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.addWidget(h.heading("整表汇总洞察", level=2))
+        head.addStretch(1)
+        # Retry button is hidden by default; we show it only when the
+        # current run has at least one fallback summary stashed in state.
+        # Click → call LLM with stored prompts → replace summary in-place.
+        self._retry_summary_btn = h.ghost_button("🔄 重试 LLM 总结")
+        self._retry_summary_btn.setVisible(False)
+        self._retry_summary_btn.setToolTip(
+            "本次运行有任务的总结因 LLM 调用持续失败而走了确定性兜底，"
+            "点这里重新调用 LLM 升级总结。"
+        )
+        self._retry_summary_btn.clicked.connect(self._on_retry_fallback_summaries)
+        head.addWidget(self._retry_summary_btn)
+        card.layout().addLayout(head)
         self._insights_browser = QTextBrowser()
         self._insights_browser.setOpenExternalLinks(True)
         self._insights_browser.setStyleSheet(
@@ -347,7 +369,118 @@ class ResultPage(QWidget):
                 "切到右上角『对话分析』提问获取动态洞察。</p>"
             )
         card.layout().addWidget(self._insights_browser, 1)
+        # Show the button if there are pending fallbacks for this run.
+        fallbacks = getattr(self, "_agent_fallbacks", None) or []
+        if fallbacks:
+            self._retry_summary_btn.setVisible(True)
+            self._retry_summary_btn.setText(
+                f"🔄 重试 LLM 总结（{len(fallbacks)} 个任务用了兜底）"
+            )
         return card
+
+    @qasync.asyncSlot()
+    async def _on_retry_fallback_summaries(self) -> None:
+        """Re-issue the LLM summary call for every task that fell back.
+
+        The agent runner stashes the exact prompts it WOULD HAVE sent into
+        `state.extra["agent_fallbacks"]` whenever the in-loop summary retries
+        all timed out. This handler walks that list, hits the LLM once per
+        entry, and replaces the corresponding task_summaries[i].summary
+        in-place. Successful entries are dropped from the fallback list so
+        they don't re-trigger.
+        """
+        from kdv.llm.client import LLMClient
+
+        fallbacks = getattr(self, "_agent_fallbacks", None) or []
+        task_summaries = getattr(self, "_agent_task_summaries", None) or []
+        preset = getattr(self, "_agent_retry_preset", None)
+        api_key = getattr(self, "_agent_retry_api_key", "") or ""
+        if not fallbacks:
+            h.toast(self.window(), "没有需要重试的总结", "info")
+            return
+        if not preset or not api_key:
+            h.toast(
+                self.window(),
+                "缺少 LLM 配置或 API key（仅当前会话内的运行可重试）",
+                "warning",
+            )
+            return
+
+        self._retry_summary_btn.setEnabled(False)
+        original_text = self._retry_summary_btn.text()
+        self._retry_summary_btn.setText("重试中…")
+
+        upgraded = 0
+        still_failing: list = []
+        async with LLMClient(preset, api_key) as client:
+            for fb in fallbacks:
+                try:
+                    resp = await client.chat(
+                        system_prompt=fb.system_prompt,
+                        user_prompt=fb.user_prompt,
+                        schema_fields=None,
+                        max_tokens=800,
+                    )
+                    text = (resp.text or "").strip()
+                    if not text:
+                        still_failing.append(fb)
+                        continue
+                    if 0 <= fb.task_index < len(task_summaries):
+                        task_summaries[fb.task_index]["summary"] = text
+                        task_summaries[fb.task_index].pop("is_fallback", None)
+                    upgraded += 1
+                except Exception as e:  # noqa: BLE001
+                    fb.last_error = str(e)[:160]
+                    still_failing.append(fb)
+
+        if upgraded > 0:
+            # Rebuild summary_markdown from the (now-upgraded) task_summaries
+            # so the insights browser, future exports, etc. all see the new
+            # prose. Mirrors main_window._on_agent_result_open's join.
+            from kdv.agent.runner import sanitize_task_summary
+
+            new_md = "\n\n".join(
+                f"## 任务 {i + 1}：{ts['task']}\n\n"
+                f"{sanitize_task_summary(ts['task'], ts['summary'])}"
+                for i, ts in enumerate(task_summaries)
+            )
+            if self.state.last_run is not None:
+                self.state.last_run.summary_markdown = new_md  # type: ignore[attr-defined]
+            html = md.markdown(new_md, extensions=["tables", "fenced_code"])
+            self._insights_browser.setHtml(_INSIGHT_CSS + html)
+
+        # Keep the still-failing list on the page so subsequent clicks only
+        # retry those.
+        self._agent_fallbacks = still_failing
+
+        self._retry_summary_btn.setEnabled(True)
+        if not still_failing:
+            self._retry_summary_btn.setVisible(False)
+            h.toast(
+                self.window(),
+                f"已升级 {upgraded} 个任务总结（LLM 调用全部成功）",
+                "success",
+            )
+        else:
+            self._retry_summary_btn.setText(
+                f"🔄 重试 LLM 总结（剩 {len(still_failing)} 个待升级）"
+            )
+            if upgraded > 0:
+                h.toast(
+                    self.window(),
+                    f"升级 {upgraded} 个；剩 {len(still_failing)} 个仍失败，可继续点重试",
+                    "warning",
+                )
+            else:
+                last = still_failing[0].last_error if still_failing else ""
+                h.toast(
+                    self.window(),
+                    f"全部仍失败：{last[:80]}",
+                    "danger",
+                )
+            # Restore button label only if we didn't already update it above.
+            if upgraded == 0:
+                self._retry_summary_btn.setText(original_text)
 
     def _append_dynamic_insight(self, ins: Insight) -> None:
         kind_color = {"info": "#3B82F6", "warning": "#F59E0B", "success": "#10B981"}

@@ -121,19 +121,36 @@ class AgentTrace:
 
 
 @dataclass
+class FallbackSummary:
+    """Material needed to retry the LLM summary call later from the UI.
+
+    Created when `_fallback_summary` exhausts its in-loop retries and falls
+    back to the deterministic Markdown. The result page exposes a "重试总结"
+    button that re-issues `client.chat(system_prompt, user_prompt)` with
+    these stored prompts to get a real LLM-written summary.
+    """
+    task_index: int
+    task_text: str
+    system_prompt: str
+    user_prompt: str
+    last_error: str = ""
+
+
+@dataclass
 class AgentResult:
     run_id: str
     columns: list[str]
     rows: list[dict[str, Any]]
     charts: list[ChartSpec]
     insights: list[Insight]
-    task_summaries: list[dict[str, str]]   # [{"task": str, "summary": str}]
+    task_summaries: list[dict[str, Any]]   # [{"task": str, "summary": str, "is_fallback"?: bool}]
     trace: AgentTrace
     prompt_tokens_total: int = 0
     completion_tokens_total: int = 0
     duration_ms_total: int = 0
     cancelled: bool = False
     aborted_reason: str = ""
+    fallbacks: list[FallbackSummary] = field(default_factory=list)
 
 
 class AgentRunner:
@@ -197,7 +214,8 @@ class AgentRunner:
         t_start = loop.time()
         prompt_tokens = 0
         completion_tokens = 0
-        task_summaries: list[dict[str, str]] = []
+        task_summaries: list[dict[str, Any]] = []
+        fallbacks: list[FallbackSummary] = []
 
         # Two clients: `fast_client` does the tool-call loop (high frequency,
         # short responses → cheap+fast); `client` writes the final summary
@@ -222,7 +240,7 @@ class AgentRunner:
                         run_id, columns, rows, tool_ctx, task_summaries,
                         trace, prompt_tokens, completion_tokens,
                         int((loop.time() - t_start) * 1000),
-                        cancelled=True,
+                        cancelled=True, fallbacks=fallbacks,
                     )
 
                 emit(TraceEvent(kind="task_start", text=task,
@@ -236,6 +254,7 @@ class AgentRunner:
                 insights_before = len(tool_ctx.insights)
                 charts_before = len(tool_ctx.charts)
 
+                fallback_collector: list[FallbackSummary] = []
                 steps_used, pt, ct, summary, abort_reason = await self._run_one_task(
                     client=client,
                     fast_client=fast_client,
@@ -247,10 +266,16 @@ class AgentRunner:
                     emit=emit,
                     cancel_event=cancel_event,
                     async_summarizer=_summarize,
+                    fallback_collector=fallback_collector,
+                    task_index=task_idx,
                 )
                 prompt_tokens += pt
                 completion_tokens += ct
-                task_summaries.append({"task": task, "summary": summary})
+                entry: dict[str, Any] = {"task": task, "summary": summary}
+                if fallback_collector:
+                    entry["is_fallback"] = True
+                    fallbacks.extend(fallback_collector)
+                task_summaries.append(entry)
                 emit(TraceEvent(
                     kind="task_end",
                     text=summary,
@@ -264,12 +289,14 @@ class AgentRunner:
                         trace, prompt_tokens, completion_tokens,
                         int((loop.time() - t_start) * 1000),
                         cancelled=False, aborted_reason=abort_reason,
+                        fallbacks=fallbacks,
                     )
 
         return self._make_result(
             run_id, columns, rows, tool_ctx, task_summaries,
             trace, prompt_tokens, completion_tokens,
             int((loop.time() - t_start) * 1000),
+            fallbacks=fallbacks,
         )
 
     async def _run_one_task(
@@ -285,6 +312,8 @@ class AgentRunner:
         emit: Callable[[TraceEvent], None],
         cancel_event: asyncio.Event | None,
         async_summarizer: Callable[[str], Any],
+        fallback_collector: list[FallbackSummary],
+        task_index: int,
     ) -> tuple[int, int, int, str, str]:
         prompt_tokens = 0
         completion_tokens = 0
@@ -456,6 +485,8 @@ class AgentRunner:
                 charts_before=charts_before,
                 abort_reason=abort_reason,
                 emit=emit,
+                fallback_collector=fallback_collector,
+                task_index=task_index,
             )
 
         return steps, prompt_tokens, completion_tokens, summary, abort_reason
@@ -471,6 +502,8 @@ class AgentRunner:
         charts_before: int,
         abort_reason: str,
         emit: Callable[[TraceEvent], None],
+        fallback_collector: list[FallbackSummary],
+        task_index: int,
     ) -> str:
         """Compose a final task summary when the agent didn't call finish_task.
 
@@ -537,6 +570,12 @@ class AgentRunner:
             f"请基于以上**真实材料**用 Markdown 写一段 200 字内的任务结论"
             f"（不要凭空臆造数据；若材料不足请直说『证据不足』）。"
         )
+        # System prompt is captured outside the retry loop so we can stash
+        # it for the UI's "重试总结" button if all in-loop attempts fail.
+        summary_system = (
+            "你是一名严谨的数据分析助手。下面用户会给你一份 agent 收集到的素材，"
+            "请只基于这些素材撰写任务结论，不允许凭空补充数字或事实。"
+        )
         # Try the LLM up to 3 times with backoff before falling back to the
         # mechanical summary. Single attempt was too easy to lose to a single
         # transient timeout — the user complained that the task ended with
@@ -545,10 +584,7 @@ class AgentRunner:
         for attempt in range(1, 4):
             try:
                 resp = await client.chat(
-                    system_prompt=(
-                        "你是一名严谨的数据分析助手。下面用户会给你一份 agent 收集到的素材，"
-                        "请只基于这些素材撰写任务结论，不允许凭空补充数字或事实。"
-                    ),
+                    system_prompt=summary_system,
                     user_prompt=user_prompt,
                     schema_fields=None,
                     max_tokens=800,
@@ -567,14 +603,24 @@ class AgentRunner:
             if attempt < 3:
                 await asyncio.sleep(min(2 ** attempt, 8))
 
-        # All LLM attempts exhausted — assemble a deterministic Markdown
-        # summary from the actual artifacts so the user always gets a
-        # usable task output instead of a silent "task ended" with nothing
-        # to show. We keep raw tool numbers verbatim — that's the data the
-        # user paid for.
+        # All in-loop LLM attempts exhausted. Stash the prompt material so
+        # the UI can offer a manual "重试总结" later (network may recover,
+        # or the user can switch to a different preset). The deterministic
+        # Markdown below is always returned NOW so the user has *something*
+        # immediately, but they keep the option to upgrade it later.
+        fallback_collector.append(FallbackSummary(
+            task_index=task_index,
+            task_text=task_text,
+            system_prompt=summary_system,
+            user_prompt=user_prompt,
+            last_error=last_err,
+        ))
         emit(TraceEvent(
             kind="error",
-            text=f"兜底总结 LLM 全部失败（{last_err}），改用确定性摘要兜底（基于真实工具结果）。",
+            text=(
+                f"兜底总结 LLM 全部失败（{last_err}）。已用确定性摘要顶上——"
+                f"结果页可点『重试总结』再调一次 LLM。"
+            ),
         ))
         parts = [f"### 任务：{task_text}\n"]
         parts.append(
@@ -595,6 +641,7 @@ class AgentRunner:
         run_id, columns, rows, tool_ctx, task_summaries, trace,
         prompt_tokens, completion_tokens, dur_ms, *,
         cancelled: bool = False, aborted_reason: str = "",
+        fallbacks: list[FallbackSummary] | None = None,
     ) -> AgentResult:
         return AgentResult(
             run_id=run_id,
@@ -609,4 +656,5 @@ class AgentRunner:
             duration_ms_total=dur_ms,
             cancelled=cancelled,
             aborted_reason=aborted_reason,
+            fallbacks=list(fallbacks or []),
         )
