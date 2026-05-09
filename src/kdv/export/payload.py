@@ -145,6 +145,24 @@ def _find_figure_canvas(w: QWidget):
     return None
 
 
+def png_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Parse a PNG's IHDR chunk to get (width, height) in pixels.
+
+    Returns None for non-PNG / truncated data. Used by the docx/pptx
+    exporters to scale charts into their layout boxes while preserving
+    aspect ratio (so a square chart doesn't get stretched to 16:9).
+    """
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    # PNG: 8-byte signature, then chunks. First chunk MUST be IHDR.
+    # Layout: 4-byte length, 4-byte type "IHDR", 4-byte width, 4-byte height, ...
+    w = int.from_bytes(data[16:20], "big")
+    h = int.from_bytes(data[20:24], "big")
+    if w <= 0 or h <= 0:
+        return None
+    return w, h
+
+
 def write_export_payload(payload: ExportPayload, *, debug_dir: Path | None = None) -> None:
     """Optional debug helper — dump captured PNGs to a directory."""
     if debug_dir is None:

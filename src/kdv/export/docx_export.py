@@ -21,7 +21,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
-from kdv.export.payload import ExportPayload
+from kdv.export.payload import ExportPayload, png_dimensions
 
 
 # ---- color palette (matches in-app QSS) ------------------------------
@@ -275,6 +275,41 @@ def _add_insights(doc: Document, payload: ExportPayload) -> None:
         _render_markdown(doc, body)
 
 
+# A4 portrait minus 2.4cm + 2.4cm side margins ≈ 16.2cm usable width.
+# Page height with 2.4cm top + 2.0cm bottom margins ≈ 24.3cm usable, but we
+# leave room for the chart heading + analysis paragraph below, so cap at 17cm.
+_DOC_CHART_MAX_W_CM = 15.5
+_DOC_CHART_MAX_H_CM = 17.0
+
+
+def _add_chart_picture(doc: Document, png: bytes) -> None:
+    """Insert a chart image while keeping it within the page box.
+
+    Previously we passed only `width=Cm(15.5)`, which lets python-docx
+    derive height — fine for landscape charts but tall charts (e.g.
+    many-category horizontal bars) would push past the bottom margin
+    and get clipped onto the next page. Now we cap whichever dimension
+    is the limiting one.
+    """
+    dims = png_dimensions(png)
+    if dims is None:
+        doc.add_picture(io.BytesIO(png), width=Cm(_DOC_CHART_MAX_W_CM))
+        return
+    iw, ih = dims
+    img_aspect = iw / ih
+    box_aspect = _DOC_CHART_MAX_W_CM / _DOC_CHART_MAX_H_CM
+    if img_aspect >= box_aspect:
+        # Wider than the box → width is the limit; height stays inside.
+        doc.add_picture(io.BytesIO(png), width=Cm(_DOC_CHART_MAX_W_CM))
+    else:
+        # Taller than the box → height is the limit (prevents page-clip).
+        doc.add_picture(io.BytesIO(png), height=Cm(_DOC_CHART_MAX_H_CM))
+    # Center the image — `add_picture` places it in a new paragraph at the
+    # end of the document, so we can grab and re-align that paragraph.
+    if doc.paragraphs:
+        doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+
 def _add_charts(doc: Document, payload: ExportPayload) -> None:
     if not payload.charts:
         return
@@ -283,7 +318,7 @@ def _add_charts(doc: Document, payload: ExportPayload) -> None:
     for ci in payload.charts:
         _heading(doc, ci.title, level=2)
         if ci.png_bytes:
-            doc.add_picture(io.BytesIO(ci.png_bytes), width=Cm(15.5))
+            _add_chart_picture(doc, ci.png_bytes)
         else:
             _muted_p(doc, "（图表截图获取失败，请重新点击导出）")
         # When the rationale is short → small caption only.

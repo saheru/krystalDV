@@ -164,12 +164,15 @@ class MainWindow(QMainWindow):
     def _on_agent_result_open(self, job) -> None:
         """Convert an AgentJob's result into a RunResult-like view + open it."""
         from kdv.analysis.runner import RunResult
+        from kdv.agent.runner import sanitize_task_summary
 
         if job.result is None:
             return
         # Build a synthetic RunResult so result_page can render it.
+        # `sanitize_task_summary` neutralizes the legacy "I have nothing to
+        # summarize" hallucination that older builds wrote into projects.
         agent_summary = "\n\n".join(
-            f"## 任务 {i + 1}：{ts['task']}\n\n{ts['summary']}"
+            f"## 任务 {i + 1}：{ts['task']}\n\n{sanitize_task_summary(ts['task'], ts['summary'])}"
             for i, ts in enumerate(job.result.task_summaries)
         )
         rr = RunResult(

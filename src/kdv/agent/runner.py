@@ -32,6 +32,46 @@ from kdv.viz.column_stats import summarize_columns
 logger = logging.getLogger(__name__)
 
 
+# Telltale fragments of the "stateless LLM has nothing to summarize" output
+# we used to ship to users (see commit b301626 — the broken _fallback_summary
+# call). Existing saved projects still contain these strings, so we keep a
+# detector that the export / display layer can use to neutralize them.
+_HALLUCINATED_FRAGMENTS = (
+    "我没有看到任何当前正在进行的任务",
+    "需要总结的发现",
+    "如果你希望我帮助处理某个具体任务",
+    "当前对话中尚未执行任何信息收集任务",
+    "请先提供以下任一内容",
+    "我将以 Markdown 格式输出结构化的发现总结",
+    "我会立即开始工作并在完成后提供总结",
+)
+
+
+def looks_like_empty_context_hallucination(text: str) -> bool:
+    """Return True if `text` matches the LLM's "I don't see any task" reply.
+
+    Used to neutralize summaries from older runs that hit the broken
+    _fallback_summary path. Trips on at least one telltale fragment AND
+    when the response is short prose (true summaries are usually longer
+    and reference the actual data).
+    """
+    if not text:
+        return False
+    sample = text.strip()
+    return any(frag in sample for frag in _HALLUCINATED_FRAGMENTS)
+
+
+def sanitize_task_summary(task: str, summary: str) -> str:
+    """Drop hallucinated boilerplate; otherwise return summary unchanged."""
+    if looks_like_empty_context_hallucination(summary):
+        return (
+            "⚠ 此任务的原结论由旧版本（无上下文调用）生成，已被自动屏蔽。\n\n"
+            f"任务原文：{task}\n\n"
+            f"请重新运行该任务以生成可用的结论。"
+        )
+    return summary
+
+
 SYSTEM_PROMPT_TEMPLATE = """\
 你是一名严谨的数据分析智能体（Agent），可以调用工具来探索和分析用户提供的结构化数据集。
 

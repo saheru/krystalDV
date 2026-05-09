@@ -20,7 +20,7 @@ from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.util import Cm, Emu, Inches, Pt
 
-from kdv.export.payload import ExportPayload
+from kdv.export.payload import ExportPayload, png_dimensions
 
 
 PRIMARY = RGBColor(0x5B, 0x6C, 0xFF)
@@ -307,6 +307,45 @@ def _slide_insights(prs: Presentation, payload: ExportPayload) -> None:
         top += Inches(1.0)
 
 
+def _add_picture_fit(
+    slide,
+    png: bytes,
+    *,
+    box_left, box_top, box_w, box_h,
+):
+    """Insert a PNG centered inside a box, preserving aspect ratio.
+
+    The previous version passed BOTH width and height to add_picture(),
+    which made python-pptx stretch the image to those exact dimensions —
+    that's why charts looked squashed/elongated. We now read the PNG's
+    real pixel dims, scale to fit inside the box, and center it.
+    """
+    if not png:
+        return
+    dims = png_dimensions(png)
+    if dims is None:
+        # Unparseable image — fall back to width-only so at least aspect
+        # is preserved (height auto-derived by python-pptx).
+        slide.shapes.add_picture(io.BytesIO(png), box_left, box_top, width=box_w)
+        return
+    iw, ih = dims
+    img_aspect = iw / ih
+    box_aspect = box_w / box_h if box_h else img_aspect
+    if img_aspect > box_aspect:
+        # Image is wider than box — width is the limit.
+        final_w = box_w
+        final_h = int(box_w / img_aspect)
+    else:
+        # Image is taller than box — height is the limit.
+        final_h = box_h
+        final_w = int(box_h * img_aspect)
+    final_left = box_left + (box_w - final_w) // 2
+    final_top = box_top + (box_h - final_h) // 2
+    slide.shapes.add_picture(
+        io.BytesIO(png), final_left, final_top, width=final_w, height=final_h
+    )
+
+
 def _slide_chart(prs: Presentation, *, title: str, rationale: str, png: bytes) -> None:
     s = _add_blank_slide(prs)
     _add_section_header(s, title=title)
@@ -316,12 +355,10 @@ def _slide_chart(prs: Presentation, *, title: str, rationale: str, png: bytes) -
     has_analysis = bool(rationale and len(rationale) > 30)
 
     if has_analysis and png:
-        img_left = Inches(0.5)
-        img_top = Inches(1.5)
-        img_width = Inches(7.6)
-        img_height = Inches(5.5)
-        s.shapes.add_picture(
-            io.BytesIO(png), img_left, img_top, width=img_width, height=img_height
+        _add_picture_fit(
+            s, png,
+            box_left=Inches(0.5), box_top=Inches(1.5),
+            box_w=Inches(7.6), box_h=Inches(5.5),
         )
         # Analysis panel on the right
         analysis_left = Inches(8.4)
@@ -351,12 +388,12 @@ def _slide_chart(prs: Presentation, *, title: str, rationale: str, png: bytes) -
                 size=11, color=TEXT_MUTED,
             )
         if png:
-            img_left = Inches(0.85)
-            img_top = Inches(1.8)
-            img_width = Inches(11.5)
-            img_height = Inches(5.2)
-            s.shapes.add_picture(
-                io.BytesIO(png), img_left, img_top, width=img_width, height=img_height
+            _add_picture_fit(
+                s, png,
+                box_left=Inches(0.85),
+                box_top=Inches(1.8) if rationale else Inches(1.5),
+                box_w=Inches(11.5),
+                box_h=Inches(5.2) if rationale else Inches(5.5),
             )
         else:
             # Capture failed — show a hint instead of an empty slide

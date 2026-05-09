@@ -148,6 +148,28 @@ class ProjectsPage(QWidget):
         if not snap:
             h.toast(self.window(), "项目读取失败（已损坏或被删除）", "danger")
             return
+        summary_md = snap.summary_markdown
+        # Older agent runs may have saved the "I see no task to summarize"
+        # hallucination from the broken _fallback_summary. Replace each task
+        # block whose body matches that pattern with a clear failure note —
+        # otherwise the user re-exports the same garbage to Word/PPT.
+        if (snap.mode or "") == "agent" and summary_md:
+            from kdv.agent.runner import looks_like_empty_context_hallucination
+            import re as _re
+
+            def _scrub(match: _re.Match) -> str:
+                head, body = match.group(1), match.group(2)
+                if looks_like_empty_context_hallucination(body):
+                    return (
+                        f"{head}\n\n⚠ 此任务原结论由旧版本（无上下文调用）生成，"
+                        f"已自动屏蔽。请重新运行该任务以生成可用的结论。"
+                    )
+                return match.group(0)
+
+            summary_md = _re.sub(
+                r"(##\s+任务[^\n]*\n)\n([\s\S]*?)(?=\n##\s+任务|\Z)",
+                _scrub, summary_md,
+            )
         result = RunResult(
             run_id=snap.project_id,
             mode=snap.mode or "summary",  # type: ignore[arg-type]
@@ -155,7 +177,7 @@ class ProjectsPage(QWidget):
             rows=list(snap.rows),
             row_outputs=list(snap.row_outputs),
             row_errors=list(snap.row_errors),
-            summary_markdown=snap.summary_markdown,
+            summary_markdown=summary_md,
             summary_structured=None,
             prompt_tokens_total=snap.prompt_tokens_total,
             completion_tokens_total=snap.completion_tokens_total,
