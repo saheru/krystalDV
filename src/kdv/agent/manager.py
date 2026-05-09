@@ -53,13 +53,19 @@ class AgentJob(QObject):
         tasks: list[str],
         preset: LLMPreset,
         api_key: str,
-        columns: list[str],
-        rows: list[dict[str, Any]],
+        columns: list[str] | None = None,
+        rows: list[dict[str, Any]] | None = None,
+        tables: list[Any] | None = None,
         registry: ToolRegistry | None = None,
         max_steps_per_task: int = 16,
         fast_preset: LLMPreset | None = None,
         fast_api_key: str = "",
     ) -> None:
+        """Either pass `tables` (list[ExcelTable], multi-sheet/multi-file) OR
+        legacy `columns + rows` (single-table). The job stashes whatever it
+        was given and re-uses it on .run() — and exposes a `columns`/`rows`
+        view for downstream UI compatibility.
+        """
         super().__init__()
         self.id: str = uuid.uuid4().hex[:12]
         self.name: str = name
@@ -68,8 +74,26 @@ class AgentJob(QObject):
         self.api_key = api_key
         self.fast_preset = fast_preset
         self.fast_api_key = fast_api_key
-        self.columns = list(columns)
-        self.rows = list(rows)
+        # Multi-table path. If only single-table args were given, lift them
+        # into a one-element list so downstream callers see a uniform shape.
+        if tables:
+            self.tables = list(tables)
+        elif columns is not None and rows is not None:
+            from kdv.excel.reader import ExcelTable as _Et
+
+            self.tables = [_Et(
+                columns=list(columns),
+                rows=list(rows),
+                sheet_name="",
+                source_path="",
+                table_id="default",
+            )]
+        else:
+            self.tables = []
+        # Single-table accessors (used by main_window result rendering).
+        primary = self.tables[0] if self.tables else None
+        self.columns = list(primary.columns) if primary else []
+        self.rows = list(primary.rows) if primary else []
         self.registry = registry or build_default_registry()
         self.max_steps_per_task = max_steps_per_task
 
@@ -110,8 +134,9 @@ class AgentJob(QObject):
                 self.event.emit(e)
 
             self.result = await runner.run(
-                columns=self.columns,
-                rows=self.rows,
+                tables=self.tables if self.tables else None,
+                columns=self.columns if not self.tables else None,
+                rows=self.rows if not self.tables else None,
                 tasks=self.tasks,
                 on_event=_on_event,
                 cancel_event=self.cancel_event,
@@ -173,8 +198,9 @@ class AgentManager(QObject):
         tasks: list[str],
         preset: LLMPreset,
         api_key: str,
-        columns: list[str],
-        rows: list[dict[str, Any]],
+        columns: list[str] | None = None,
+        rows: list[dict[str, Any]] | None = None,
+        tables: list[Any] | None = None,
         fast_preset: LLMPreset | None = None,
         fast_api_key: str = "",
     ) -> AgentJob:
@@ -185,6 +211,7 @@ class AgentManager(QObject):
             api_key=api_key,
             columns=columns,
             rows=rows,
+            tables=tables,
             fast_preset=fast_preset,
             fast_api_key=fast_api_key,
         )

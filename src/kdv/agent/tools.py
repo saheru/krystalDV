@@ -47,14 +47,76 @@ class Insight:
 
 
 @dataclass
-class ToolContext:
-    """Runtime state passed to every tool handler."""
+class TableSlot:
+    """One queryable table inside a multi-table workbook."""
 
+    table_id: str
     columns: list[str]
     rows: list[dict[str, Any]]
     stats: dict[str, ColumnStats]
+    sheet_name: str = ""
+    source_path: str = ""
+
+
+@dataclass
+class ToolContext:
+    """Runtime state passed to every tool handler.
+
+    Supports multi-table workbooks: every tool that reads data accepts an
+    optional `table` argument naming one of `tables[*].table_id`; if absent,
+    the first table is used. Single-table back-compat: callers that pass
+    `columns=` / `rows=` / `stats=` get a one-slot context, and the legacy
+    `ctx.columns / .rows / .stats` accessors still work via the property
+    proxies below.
+    """
+
+    tables: list[TableSlot] = field(default_factory=list)
     charts: list[ChartSpec] = field(default_factory=list)
     insights: list[Insight] = field(default_factory=list)
+    # Back-compat constructor inputs — collapsed into a single TableSlot
+    # in __post_init__ if `tables` is empty.
+    columns: list[str] | None = None  # type: ignore[assignment]
+    rows: list[dict[str, Any]] | None = None  # type: ignore[assignment]
+    stats: dict[str, ColumnStats] | None = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        # If caller passed legacy single-table kwargs (columns/rows/stats)
+        # but no `tables`, build a one-slot table list. Either form works.
+        if not self.tables and (self.columns is not None or self.rows is not None):
+            self.tables = [TableSlot(
+                table_id="default",
+                columns=list(self.columns or []),
+                rows=list(self.rows or []),
+                stats=dict(self.stats or {}),
+            )]
+        # Now make columns/rows/stats live aliases of the primary table.
+        # We deliberately set attributes (not properties) so existing tool
+        # code that does `ctx.charts.append(...)` etc. keeps fast access.
+        self._refresh_aliases()
+
+    def _refresh_aliases(self) -> None:
+        primary = self.tables[0] if self.tables else None
+        self.columns = primary.columns if primary else []  # type: ignore[assignment]
+        self.rows = primary.rows if primary else []  # type: ignore[assignment]
+        self.stats = primary.stats if primary else {}  # type: ignore[assignment]
+
+    def get_table(self, table_id: str | None = None) -> TableSlot | None:
+        """Resolve a `table` tool argument to a TableSlot.
+
+        `None` / empty / missing → first table (default). Unknown id → None;
+        callers turn that into an error message for the LLM.
+        """
+        if not self.tables:
+            return None
+        if not table_id:
+            return self.tables[0]
+        for t in self.tables:
+            if t.table_id == table_id:
+                return t
+        return None
+
+    def list_table_ids(self) -> list[str]:
+        return [t.table_id for t in self.tables]
 
 
 # ----------------------------------------------------------------------
@@ -107,6 +169,31 @@ def _truncate(s: str, n: int = 4000) -> str:
     return s[:n] + f"\n…[truncated, full output {len(s)} chars]"
 
 
+def _resolve_table(ctx: ToolContext, args: dict[str, Any]) -> tuple[TableSlot | None, str]:
+    """Pick the table targeted by a tool call; either return the slot or the
+    error string the LLM should see."""
+    tid = (args.get("table") or args.get("table_id") or "").strip()
+    slot = ctx.get_table(tid or None)
+    if slot is None:
+        if not ctx.tables:
+            return None, "未加载任何数据表"
+        return None, (
+            f"找不到表 `{tid}`。可用表：{', '.join(ctx.list_table_ids())}"
+        )
+    return slot, ""
+
+
+def _table_param_schema() -> dict[str, Any]:
+    """Common schema fragment for the `table` argument shared by all tools."""
+    return {
+        "type": "string",
+        "description": (
+            "目标表的 table_id，如 'invoices.xlsx/Sheet1'。"
+            "省略则用第一张（默认）表。多表时务必明确指定，避免分析错对象。"
+        ),
+    }
+
+
 def _to_float(v: Any) -> float | None:
     if v is None or v == "" or isinstance(v, bool):
         return None
@@ -116,11 +203,43 @@ def _to_float(v: Any) -> float | None:
         return None
 
 
+# ---- list_tables -------------------------------------------------------
+def _t_list_tables(ctx: ToolContext, args: dict[str, Any]) -> str:
+    """Multi-table overview — list every loaded table with rows/cols/source.
+
+    Agent should call this FIRST when working with multi-table workbooks so
+    it knows which `table` ids to pass to subsequent tools.
+    """
+    if not ctx.tables:
+        return "没有加载任何数据表。"
+    lines = [f"共 {len(ctx.tables)} 张表："]
+    for t in ctx.tables:
+        src = (t.source_path or "").split("/")[-1] or "(未知文件)"
+        lines.append(
+            f"- table_id=`{t.table_id}`  {len(t.rows)} 行 × {len(t.columns)} 列"
+            f"  · 来源 {src}"
+            + (f" / sheet={t.sheet_name}" if t.sheet_name else "")
+        )
+        # 列出前 8 列做一个 schema 提示
+        col_preview = ", ".join(t.columns[:8]) + (" …" if len(t.columns) > 8 else "")
+        lines.append(f"    列：{col_preview}")
+    if len(ctx.tables) > 1:
+        lines.append(
+            "\n📌 工具调用务必带 `table=<table_id>`，否则默认操作第一张表 "
+            f"(`{ctx.tables[0].table_id}`)。"
+        )
+    return "\n".join(lines)
+
+
 # ---- list_columns -----------------------------------------------------
 def _t_list_columns(ctx: ToolContext, args: dict[str, Any]) -> str:
-    lines = [f"数据集 {len(ctx.rows)} 行，共 {len(ctx.columns)} 列："]
-    for col in ctx.columns:
-        s = ctx.stats.get(col)
+    slot, err = _resolve_table(ctx, args)
+    if err:
+        return err
+    assert slot is not None
+    lines = [f"表 `{slot.table_id}`：{len(slot.rows)} 行，共 {len(slot.columns)} 列："]
+    for col in slot.columns:
+        s = slot.stats.get(col)
         if not s:
             continue
         line = f"- `{col}` [{s.kind}] 计数={s.count} 缺失={s.null_count} 唯一={s.distinct_count}"
@@ -137,16 +256,20 @@ def _t_list_columns(ctx: ToolContext, args: dict[str, Any]) -> str:
 
 # ---- sample_rows -------------------------------------------------------
 def _t_sample_rows(ctx: ToolContext, args: dict[str, Any]) -> str:
+    slot, err = _resolve_table(ctx, args)
+    if err:
+        return err
+    assert slot is not None
     n = int(args.get("n", 5))
     n = max(1, min(n, 50))
-    cols = args.get("columns") or ctx.columns
+    cols = args.get("columns") or slot.columns
     if isinstance(cols, str):
         cols = [c.strip() for c in cols.split(",")]
-    cols = [c for c in cols if c in ctx.columns]
+    cols = [c for c in cols if c in slot.columns]
     if not cols:
-        cols = ctx.columns
+        cols = slot.columns
 
-    rows = ctx.rows[:n]
+    rows = slot.rows[:n]
     head = "| " + " | ".join(cols) + " |"
     sep = "|" + "|".join(["---"] * len(cols)) + "|"
     body = []
@@ -157,10 +280,14 @@ def _t_sample_rows(ctx: ToolContext, args: dict[str, Any]) -> str:
 
 # ---- describe_column ---------------------------------------------------
 def _t_describe(ctx: ToolContext, args: dict[str, Any]) -> str:
+    slot, err = _resolve_table(ctx, args)
+    if err:
+        return err
+    assert slot is not None
     col = args.get("column", "")
-    if col not in ctx.stats:
-        return f"列 `{col}` 不存在。可用列：{', '.join(ctx.columns)}"
-    s = ctx.stats[col]
+    if col not in slot.stats:
+        return f"列 `{col}` 不存在于表 `{slot.table_id}`。可用列：{', '.join(slot.columns)}"
+    s = slot.stats[col]
     out = {
         "name": s.name,
         "kind": s.kind,
@@ -181,14 +308,18 @@ def _t_describe(ctx: ToolContext, args: dict[str, Any]) -> str:
 
 # ---- aggregate ---------------------------------------------------------
 def _t_aggregate(ctx: ToolContext, args: dict[str, Any]) -> str:
+    slot, err = _resolve_table(ctx, args)
+    if err:
+        return err
+    assert slot is not None
     col = args.get("column", "")
     op = args.get("op", "mean")
     group_by = args.get("group_by", "")
-    if col not in ctx.columns:
-        return f"列 `{col}` 不存在"
+    if col not in slot.columns:
+        return f"列 `{col}` 不存在于表 `{slot.table_id}`"
 
     if not group_by:
-        nums = [_to_float(r.get(col)) for r in ctx.rows]
+        nums = [_to_float(r.get(col)) for r in slot.rows]
         nums = [n for n in nums if n is not None]
         if not nums:
             return "该列无可用数值"
@@ -206,12 +337,12 @@ def _t_aggregate(ctx: ToolContext, args: dict[str, Any]) -> str:
             v = statistics.pstdev(nums) if len(nums) > 1 else 0.0
         else:
             v = sum(nums) / len(nums)
-        return f"{op}({col}) = {v}"
+        return f"{op}({col}) = {v}  (table={slot.table_id})"
 
-    if group_by not in ctx.columns:
-        return f"分组列 `{group_by}` 不存在"
+    if group_by not in slot.columns:
+        return f"分组列 `{group_by}` 不存在于表 `{slot.table_id}`"
     buckets: dict[str, list[float]] = {}
-    for r in ctx.rows:
+    for r in slot.rows:
         k = str(r.get(group_by, "")).strip()
         if not k:
             continue
@@ -236,19 +367,24 @@ def _t_aggregate(ctx: ToolContext, args: dict[str, Any]) -> str:
         rows.append((k, agg, len(vs)))
     rows.sort(key=lambda x: x[1], reverse=True)
     return _truncate(
-        "| 分组 | " + op + " | 计数 |\n|---|---|---|\n"
+        f"表 `{slot.table_id}`：\n"
+        + "| 分组 | " + op + " | 计数 |\n|---|---|---|\n"
         + "\n".join(f"| {k} | {v:.2f} | {n} |" for k, v, n in rows[:30])
     )
 
 
 # ---- filter_rows -------------------------------------------------------
 def _t_filter(ctx: ToolContext, args: dict[str, Any]) -> str:
+    slot, err = _resolve_table(ctx, args)
+    if err:
+        return err
+    assert slot is not None
     col = args.get("column", "")
     op = args.get("op", "eq")
     value = args.get("value", "")
     n_show = int(args.get("show", 5))
-    if col not in ctx.columns:
-        return f"列 `{col}` 不存在"
+    if col not in slot.columns:
+        return f"列 `{col}` 不存在于表 `{slot.table_id}`"
 
     def keep(v) -> bool:
         if op == "eq":
@@ -272,20 +408,24 @@ def _t_filter(ctx: ToolContext, args: dict[str, Any]) -> str:
             return n <= t
         return False
 
-    matches = [r for r in ctx.rows if keep(r.get(col))]
+    matches = [r for r in slot.rows if keep(r.get(col))]
     sample = matches[:n_show]
     body = "\n".join(json.dumps(r, ensure_ascii=False, default=str)[:200] for r in sample)
-    return f"匹配 {len(matches)}/{len(ctx.rows)} 行。前 {len(sample)} 条：\n{body}"
+    return f"表 `{slot.table_id}` 匹配 {len(matches)}/{len(slot.rows)} 行。前 {len(sample)} 条：\n{body}"
 
 
 # ---- correlate ---------------------------------------------------------
 def _t_correlate(ctx: ToolContext, args: dict[str, Any]) -> str:
+    slot, err = _resolve_table(ctx, args)
+    if err:
+        return err
+    assert slot is not None
     a = args.get("col_a", "")
     b = args.get("col_b", "")
-    if a not in ctx.columns or b not in ctx.columns:
-        return f"列名错误。可用列：{', '.join(ctx.columns)}"
+    if a not in slot.columns or b not in slot.columns:
+        return f"列名错误。表 `{slot.table_id}` 可用列：{', '.join(slot.columns)}"
     pairs: list[tuple[float, float]] = []
-    for r in ctx.rows:
+    for r in slot.rows:
         va = _to_float(r.get(a))
         vb = _to_float(r.get(b))
         if va is None or vb is None:
@@ -311,19 +451,27 @@ def _t_correlate(ctx: ToolContext, args: dict[str, Any]) -> str:
 
 # ---- distinct_values ---------------------------------------------------
 def _t_distinct(ctx: ToolContext, args: dict[str, Any]) -> str:
+    slot, err = _resolve_table(ctx, args)
+    if err:
+        return err
+    assert slot is not None
     col = args.get("column", "")
-    if col not in ctx.columns:
-        return f"列 `{col}` 不存在"
-    c = Counter(str(r.get(col, "")).strip() for r in ctx.rows if r.get(col) not in (None, ""))
+    if col not in slot.columns:
+        return f"列 `{col}` 不存在于表 `{slot.table_id}`"
+    c = Counter(str(r.get(col, "")).strip() for r in slot.rows if r.get(col) not in (None, ""))
     items = c.most_common(50)
     return _truncate(
-        f"`{col}` 共 {len(c)} 个不同值（Top 50 见下）：\n"
+        f"表 `{slot.table_id}` 列 `{col}` 共 {len(c)} 个不同值（Top 50 见下）：\n"
         + "\n".join(f"- {k}  ×{v}" for k, v in items)
     )
 
 
 # ---- text_search -------------------------------------------------------
 def _t_text_search(ctx: ToolContext, args: dict[str, Any]) -> str:
+    slot, err = _resolve_table(ctx, args)
+    if err:
+        return err
+    assert slot is not None
     pattern = args.get("pattern", "")
     col = args.get("column", "")
     flags = re.IGNORECASE
@@ -331,9 +479,9 @@ def _t_text_search(ctx: ToolContext, args: dict[str, Any]) -> str:
         rx = re.compile(pattern, flags)
     except re.error as e:
         return f"正则错误：{e}"
-    candidate_cols = [col] if col and col in ctx.columns else ctx.columns
+    candidate_cols = [col] if col and col in slot.columns else slot.columns
     matches = []
-    for i, r in enumerate(ctx.rows):
+    for i, r in enumerate(slot.rows):
         for c in candidate_cols:
             v = r.get(c)
             if v is None:
@@ -357,6 +505,12 @@ _CHART_KINDS = {
 
 
 def _t_add_chart(ctx: ToolContext, args: dict[str, Any]) -> str:
+    # Charts are bound to ONE table for column validation. The `table` arg
+    # picks which one — defaults to the first.
+    slot, err = _resolve_table(ctx, args)
+    if err:
+        return err
+    assert slot is not None
     kind = args.get("kind", "")
     cols = args.get("columns", [])
     if isinstance(cols, str):
@@ -365,14 +519,18 @@ def _t_add_chart(ctx: ToolContext, args: dict[str, Any]) -> str:
     rationale = args.get("rationale", "")
     if kind not in _CHART_KINDS:
         return f"图表类型不支持：{kind}。可选：{sorted(_CHART_KINDS)}"
-    bad = [c for c in cols if c not in ctx.columns]
+    bad = [c for c in cols if c not in slot.columns]
     if bad and kind not in ("stat_summary", "kpi"):
-        return f"未知列：{bad}。可用列：{ctx.columns}"
+        return f"未知列：{bad}。表 `{slot.table_id}` 可用列：{slot.columns}"
+    params = dict(args.get("params") or {})
+    # Stash the source table in chart params so the result page can route
+    # it to the right rows/columns at render time.
+    params.setdefault("_table_id", slot.table_id)
     ctx.charts.append(
         ChartSpec(kind=kind, columns=cols, title=title, rationale=rationale,
-                  params=args.get("params") or {})
+                  params=params)
     )
-    return f"已添加图表：{kind}({cols}) 标题=「{title}」"
+    return f"已添加图表：{kind}({cols}) 标题=「{title}」 (来自 {slot.table_id})"
 
 
 # ---- record_insight ----------------------------------------------------
@@ -396,6 +554,10 @@ def _t_reconcile(ctx: ToolContext, args: dict[str, Any]) -> str:
     chat, asks agent to compute per-group diff and total diff. The tool also
     auto-registers a horizontal bar chart of the diff.
     """
+    slot, err = _resolve_table(ctx, args)
+    if err:
+        return err
+    assert slot is not None
     group_col = args.get("group_column", "")
     value_col = args.get("value_column", "")
     external = args.get("external_values", {})
@@ -403,15 +565,15 @@ def _t_reconcile(ctx: ToolContext, args: dict[str, Any]) -> str:
     label = args.get("label", "对账")
     auto_chart = bool(args.get("auto_chart", True))
 
-    if group_col not in ctx.columns:
-        return f"分组列 `{group_col}` 不存在"
-    if value_col not in ctx.columns:
-        return f"数值列 `{value_col}` 不存在"
+    if group_col not in slot.columns:
+        return f"分组列 `{group_col}` 不存在于表 `{slot.table_id}`"
+    if value_col not in slot.columns:
+        return f"数值列 `{value_col}` 不存在于表 `{slot.table_id}`"
     if not isinstance(external, dict) or not external:
         return "external_values 必须是 {分组名: 外部数值} 的 JSON 对象"
 
     buckets: dict[str, list[float]] = {}
-    for r in ctx.rows:
+    for r in slot.rows:
         k = str(r.get(group_col, "")).strip()
         if not k:
             continue
@@ -486,6 +648,7 @@ def _t_reconcile(ctx: ToolContext, args: dict[str, Any]) -> str:
             title=f"{label}：{group_col} 内部 vs 外部",
             rationale=f"差额合计 {total_diff:+.2f}",
             params={
+                "_table_id": slot.table_id,
                 "internal": [(k, iv) for k, iv, *_ in rows],
                 "external": [(k, ev) for k, _, ev, *_ in rows],
                 "diff": [(k, dv) for k, _, _, dv, _ in rows],
@@ -493,6 +656,194 @@ def _t_reconcile(ctx: ToolContext, args: dict[str, Any]) -> str:
         ))
 
     return _truncate("\n".join(lines))
+
+
+# ---- cross_reconcile (compare two tables) -----------------------------
+def _t_cross_reconcile(ctx: ToolContext, args: dict[str, Any]) -> str:
+    """Reconcile two tables on a shared group key.
+
+    Aggregate `value_column_a` per `group_column` in `table_a`, do the same
+    for `table_b`, and compare the two per group. Useful for e.g. comparing
+    last month's invoice vs this month's, or internal ledger vs external
+    statement when both live in their own table.
+    """
+    tid_a = (args.get("table_a") or "").strip()
+    tid_b = (args.get("table_b") or "").strip()
+    if not tid_a or not tid_b:
+        return "需提供 table_a 和 table_b（可用：" + ", ".join(ctx.list_table_ids()) + "）"
+    a = ctx.get_table(tid_a)
+    b = ctx.get_table(tid_b)
+    if a is None:
+        return f"找不到 table_a=`{tid_a}`"
+    if b is None:
+        return f"找不到 table_b=`{tid_b}`"
+    group_col = args.get("group_column", "")
+    val_a = args.get("value_column_a", "") or args.get("value_column", "")
+    val_b = args.get("value_column_b", "") or args.get("value_column", "")
+    op = args.get("op", "sum")
+    label = args.get("label", "跨表对账")
+    auto_chart = bool(args.get("auto_chart", True))
+    if group_col not in a.columns:
+        return f"`{group_col}` 不在表 `{a.table_id}` 中。a 列：{', '.join(a.columns)}"
+    if group_col not in b.columns:
+        return f"`{group_col}` 不在表 `{b.table_id}` 中。b 列：{', '.join(b.columns)}"
+    if val_a not in a.columns:
+        return f"`{val_a}` 不在表 `{a.table_id}` 中"
+    if val_b not in b.columns:
+        return f"`{val_b}` 不在表 `{b.table_id}` 中"
+
+    def _aggregate(slot: TableSlot, gcol: str, vcol: str) -> dict[str, float]:
+        buckets: dict[str, list[float]] = {}
+        for r in slot.rows:
+            k = str(r.get(gcol, "")).strip()
+            if not k:
+                continue
+            v = _to_float(r.get(vcol))
+            if v is None:
+                continue
+            buckets.setdefault(k, []).append(v)
+        out: dict[str, float] = {}
+        for k, vs in buckets.items():
+            if op == "mean":
+                out[k] = sum(vs) / len(vs)
+            elif op == "max":
+                out[k] = max(vs)
+            elif op == "min":
+                out[k] = min(vs)
+            elif op == "count":
+                out[k] = float(len(vs))
+            elif op == "median":
+                out[k] = statistics.median(vs)
+            else:
+                out[k] = float(sum(vs))
+        return out
+
+    agg_a = _aggregate(a, group_col, val_a)
+    agg_b = _aggregate(b, group_col, val_b)
+    keys = sorted(set(agg_a) | set(agg_b))
+    rows = []
+    total_a = 0.0
+    total_b = 0.0
+    for k in keys:
+        va = agg_a.get(k, 0.0)
+        vb = agg_b.get(k, 0.0)
+        total_a += va
+        total_b += vb
+        diff = va - vb
+        pct = (diff / vb * 100) if vb else float("nan")
+        rows.append((k, va, vb, diff, pct))
+    rows.sort(key=lambda x: abs(x[3]), reverse=True)
+
+    lines = [
+        f"跨表对账（{label}）：`{a.table_id}` vs `{b.table_id}` on `{group_col}`",
+        f"| 分组 | A:{op}({val_a}) | B:{op}({val_b}) | 差额 (A−B) | 差额% |",
+        "|---|---|---|---|---|",
+    ]
+    for k, va, vb, dv, pct in rows:
+        pct_s = f"{pct:+.2f}%" if not math.isnan(pct) else "n/a"
+        lines.append(f"| {k} | {va:.2f} | {vb:.2f} | {dv:+.2f} | {pct_s} |")
+    total_diff = total_a - total_b
+    total_pct = (total_diff / total_b * 100) if total_b else float("nan")
+    pct_s = f"{total_pct:+.2f}%" if not math.isnan(total_pct) else "n/a"
+    lines.append(
+        f"| **合计** | **{total_a:.2f}** | **{total_b:.2f}** | "
+        f"**{total_diff:+.2f}** | **{pct_s}** |"
+    )
+
+    if auto_chart and rows:
+        ctx.charts.append(ChartSpec(
+            kind="reconcile_bar",
+            columns=[group_col, val_a],
+            title=f"{label}：{a.table_id} vs {b.table_id}",
+            rationale=f"差额合计 {total_diff:+.2f}",
+            params={
+                "_table_id": a.table_id,
+                "internal": [(k, va) for k, va, *_ in rows],
+                "external": [(k, vb) for k, _, vb, *_ in rows],
+                "diff": [(k, dv) for k, _, _, dv, _ in rows],
+            },
+        ))
+    return _truncate("\n".join(lines))
+
+
+# ---- join_tables ------------------------------------------------------
+def _t_join_tables(ctx: ToolContext, args: dict[str, Any]) -> str:
+    """Inner-join two tables on a key column and return a sample of the result.
+
+    Lightweight — we don't materialise the join into ToolContext.tables; we
+    just print enough rows to let the agent pick what to query next. For
+    heavy joins the user should pre-process in Excel.
+    """
+    tid_a = (args.get("table_a") or "").strip()
+    tid_b = (args.get("table_b") or "").strip()
+    a = ctx.get_table(tid_a)
+    b = ctx.get_table(tid_b)
+    if a is None or b is None:
+        return "需提供 table_a 和 table_b（可用：" + ", ".join(ctx.list_table_ids()) + "）"
+    key_a = args.get("key_a") or args.get("key") or ""
+    key_b = args.get("key_b") or args.get("key") or ""
+    n_show = int(args.get("show", 10))
+    n_show = max(1, min(n_show, 50))
+    if key_a not in a.columns:
+        return f"`{key_a}` 不在表 `{a.table_id}` 中"
+    if key_b not in b.columns:
+        return f"`{key_b}` 不在表 `{b.table_id}` 中"
+
+    # Build lookup on b to keep the inner-join cost reasonable.
+    bkey: dict[str, list[dict[str, Any]]] = {}
+    for r in b.rows:
+        k = str(r.get(key_b, "")).strip()
+        if k:
+            bkey.setdefault(k, []).append(r)
+
+    # Disambiguate column names: a's columns keep their name; b's columns
+    # get a `b.` prefix unless they're the join key (which we drop from b).
+    out_cols = list(a.columns)
+    b_renamed: dict[str, str] = {}
+    for c in b.columns:
+        if c == key_b:
+            continue
+        new_name = c if c not in a.columns else f"b.{c}"
+        b_renamed[c] = new_name
+        out_cols.append(new_name)
+
+    matched_count = 0
+    sample: list[dict[str, Any]] = []
+    for ra in a.rows:
+        k = str(ra.get(key_a, "")).strip()
+        bs = bkey.get(k, [])
+        if not bs:
+            continue
+        for rb in bs:
+            matched_count += 1
+            if len(sample) < n_show:
+                merged: dict[str, Any] = dict(ra)
+                for c, new_name in b_renamed.items():
+                    merged[new_name] = rb.get(c)
+                sample.append(merged)
+        if matched_count >= 1000:
+            break
+
+    if not sample:
+        return (
+            f"`{a.table_id}` ⋈ `{b.table_id}` on {key_a}={key_b}：无匹配行。"
+            f"先用 distinct_values 看两表的键值是否一致。"
+        )
+
+    head = "| " + " | ".join(out_cols[:8]) + " |"
+    sep = "|" + "|".join(["---"] * min(len(out_cols), 8)) + "|"
+    body = []
+    for r in sample:
+        body.append(
+            "| " + " | ".join(
+                str(r.get(c, "")).replace("|", "\\|")[:60] for c in out_cols[:8]
+            ) + " |"
+        )
+    return _truncate(
+        f"`{a.table_id}` ⋈ `{b.table_id}` on `{key_a}=={key_b}`，"
+        f"共 {matched_count} 行匹配，前 {len(sample)} 条（仅前 8 列）：\n"
+        + "\n".join([head, sep] + body)
+    )
 
 
 # ---- record_user_data --------------------------------------------------
@@ -536,9 +887,26 @@ def build_default_registry() -> ToolRegistry:
     reg = ToolRegistry()
 
     reg.register(Tool(
-        name="list_columns",
-        description="列出数据集所有列、类型与基础统计。**首次必须先调用以获得 schema 概览。**",
+        name="list_tables",
+        description=(
+            "列出本次工作簿里所有数据表（每个 sheet / 每个文件 = 一张表）。"
+            "**多表场景必须先调用此工具拿到 table_id**，后续每个工具都靠 "
+            "table 参数指定要操作哪一张。单表则不必。"
+        ),
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        handler=_t_list_tables,
+    ))
+
+    reg.register(Tool(
+        name="list_columns",
+        description="列出某张表的所有列、类型与基础统计。**首次分析某张表前必须先调用以获得 schema 概览。**",
+        parameters={
+            "type": "object",
+            "properties": {
+                "table": _table_param_schema(),
+            },
+            "additionalProperties": False,
+        },
         handler=_t_list_columns,
     ))
 
@@ -548,6 +916,7 @@ def build_default_registry() -> ToolRegistry:
         parameters={
             "type": "object",
             "properties": {
+                "table": _table_param_schema(),
                 "n": {"type": "integer", "minimum": 1, "maximum": 50, "default": 5},
                 "columns": {"type": "array", "items": {"type": "string"}},
             },
@@ -561,7 +930,10 @@ def build_default_registry() -> ToolRegistry:
         description="查看某一列的详细统计（min/max/mean/median/topN）",
         parameters={
             "type": "object",
-            "properties": {"column": {"type": "string"}},
+            "properties": {
+                "table": _table_param_schema(),
+                "column": {"type": "string"},
+            },
             "required": ["column"],
         },
         handler=_t_describe,
@@ -573,6 +945,7 @@ def build_default_registry() -> ToolRegistry:
         parameters={
             "type": "object",
             "properties": {
+                "table": _table_param_schema(),
                 "column": {"type": "string", "description": "数值列"},
                 "op": {
                     "type": "string",
@@ -592,6 +965,7 @@ def build_default_registry() -> ToolRegistry:
         parameters={
             "type": "object",
             "properties": {
+                "table": _table_param_schema(),
                 "column": {"type": "string"},
                 "op": {
                     "type": "string",
@@ -611,6 +985,7 @@ def build_default_registry() -> ToolRegistry:
         parameters={
             "type": "object",
             "properties": {
+                "table": _table_param_schema(),
                 "col_a": {"type": "string"},
                 "col_b": {"type": "string"},
             },
@@ -624,7 +999,10 @@ def build_default_registry() -> ToolRegistry:
         description="返回某列的去重值与频次（前 50）",
         parameters={
             "type": "object",
-            "properties": {"column": {"type": "string"}},
+            "properties": {
+                "table": _table_param_schema(),
+                "column": {"type": "string"},
+            },
             "required": ["column"],
         },
         handler=_t_distinct,
@@ -636,6 +1014,7 @@ def build_default_registry() -> ToolRegistry:
         parameters={
             "type": "object",
             "properties": {
+                "table": _table_param_schema(),
                 "pattern": {"type": "string", "description": "Python 正则"},
                 "column": {"type": "string", "description": "可选：限定列"},
             },
@@ -654,6 +1033,7 @@ def build_default_registry() -> ToolRegistry:
         parameters={
             "type": "object",
             "properties": {
+                "table": _table_param_schema(),
                 "kind": {"type": "string"},
                 "columns": {"type": "array", "items": {"type": "string"}},
                 "title": {"type": "string"},
@@ -691,6 +1071,7 @@ def build_default_registry() -> ToolRegistry:
         parameters={
             "type": "object",
             "properties": {
+                "table": _table_param_schema(),
                 "group_column": {"type": "string", "description": "用于分组的列（例如 渠道商/供应商）"},
                 "value_column": {"type": "string", "description": "要聚合的数值列（例如 金额/成本）"},
                 "external_values": {
@@ -709,6 +1090,56 @@ def build_default_registry() -> ToolRegistry:
             "required": ["group_column", "value_column", "external_values"],
         },
         handler=_t_reconcile,
+    ))
+
+    reg.register(Tool(
+        name="cross_reconcile",
+        description=(
+            "**跨表对账**：在两张表上做聚合并按分组键 `group_column` 比对差额。"
+            "用于 A 表 vs B 表场景：内部账 vs 外部对账单（各自存一张表）、"
+            "上月 vs 本月、计划 vs 实际等。返回每组的差额、差额% 与合计差额。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "table_a": {"type": "string", "description": "A 表 table_id"},
+                "table_b": {"type": "string", "description": "B 表 table_id"},
+                "group_column": {"type": "string", "description": "两表共享的分组列名"},
+                "value_column_a": {"type": "string", "description": "A 表的数值列；省略则用 value_column"},
+                "value_column_b": {"type": "string", "description": "B 表的数值列；省略则用 value_column"},
+                "value_column": {"type": "string", "description": "若两表数值列同名，可只填这个"},
+                "op": {
+                    "type": "string",
+                    "enum": ["sum", "mean", "median", "max", "min", "count"],
+                    "default": "sum",
+                },
+                "label": {"type": "string"},
+                "auto_chart": {"type": "boolean", "default": True},
+            },
+            "required": ["table_a", "table_b", "group_column"],
+        },
+        handler=_t_cross_reconcile,
+    ))
+
+    reg.register(Tool(
+        name="join_tables",
+        description=(
+            "**跨表连接**（inner-join）：用 `key_a` / `key_b` 做键，把 A 与 B 行匹配，"
+            "返回前 N 条合并行（用于探查关联关系）。冲突列名会加 `b.` 前缀。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "table_a": {"type": "string"},
+                "table_b": {"type": "string"},
+                "key_a": {"type": "string", "description": "A 表的连接键"},
+                "key_b": {"type": "string", "description": "B 表的连接键；如果两表同名可只填 key"},
+                "key": {"type": "string", "description": "两表同名时的连接键（与 key_a/key_b 二选一）"},
+                "show": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+            },
+            "required": ["table_a", "table_b"],
+        },
+        handler=_t_join_tables,
     ))
 
     reg.register(Tool(

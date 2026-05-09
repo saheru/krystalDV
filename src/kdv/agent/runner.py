@@ -72,7 +72,7 @@ def sanitize_task_summary(task: str, summary: str) -> str:
     return summary
 
 
-SYSTEM_PROMPT_TEMPLATE = """\
+SYSTEM_PROMPT_SINGLE = """\
 你是一名严谨的数据分析智能体（Agent），可以调用工具来探索和分析用户提供的结构化数据集。
 
 【数据集元信息】
@@ -102,6 +102,46 @@ SYSTEM_PROMPT_TEMPLATE = """\
 - 优先调用 `add_chart` 和 `record_insight` 把发现固化下来；最终的 finish_task
   summary 仅是收尾。
 """
+
+
+SYSTEM_PROMPT_MULTI = """\
+你是一名严谨的数据分析智能体（Agent），本次工作簿包含 **{n_tables} 张表**：
+
+{table_overview}
+
+【多表工作要点】
+- **每个数据查询工具都接受 `table` 参数**——请明确指定要操作哪张表，否则
+  默认操作第一张（`{default_table_id}`）。
+- 跨表分析有专用工具：
+  - `cross_reconcile` — 两张表分组聚合后比对差额（A vs B 对账场景）
+  - `join_tables`     — 按键 inner-join 两张表，看关联行
+  - `list_tables`     — 重新列出当前可用的全部表
+- 工作流程：
+  1. 先 `list_tables` 看清全貌（如果尚未获取）。
+  2. 对每张要分析的表先 `list_columns` + `sample_rows` 建立直觉。
+  3. 通过 `aggregate` / `filter_rows` / `correlate` 等收集证据；多表对比用
+     `cross_reconcile` / `join_tables`。
+  4. 把发现保存为图表（`add_chart`，可指定 `table=`）和洞察（`record_insight`）。
+  5. 任务完成时调用 `finish_task` 给出 Markdown 总结。
+
+【效率准则（重要）】
+- **同一回合并发多个独立工具调用**（OpenAI 协议支持单回合多 tool_calls）。
+  特别是多表场景：往往要对每张表都做一次同样的查询——一次性全发出去，不要
+  串行逐表来一遍。
+- 反例：先查 A 表 sum，再查 B 表 sum，再 correlate。
+- 正例：同回合 [aggregate(table=A,...), aggregate(table=B,...), correlate(...)]。
+
+【其他准则】
+- 所有结论必须来自工具返回值，不要凭空臆造。
+- 工具返回越简短越好；后续还有任务，注意 token 预算。
+- 用户任务模糊时自行拆解为可验证的子问题。
+- 关键发现立即 `record_insight` 固化——这能避免上下文压缩时丢失（压缩只动
+  消息历史，不动 insights）。
+"""
+
+
+# Single-source so other modules can import it without importing the runner.
+SYSTEM_PROMPT_TEMPLATE = SYSTEM_PROMPT_SINGLE
 
 
 # Tool-call turns are short — the model just emits a tool_calls JSON.
@@ -178,12 +218,20 @@ class AgentRunner:
     async def run(
         self,
         *,
-        columns: list[str],
-        rows: list[dict[str, Any]],
+        columns: list[str] | None = None,
+        rows: list[dict[str, Any]] | None = None,
+        tables: list[Any] | None = None,
         tasks: list[str],
         on_event: Callable[[TraceEvent], None] | None = None,
         cancel_event: asyncio.Event | None = None,
     ) -> AgentResult:
+        """Run the agent over one or more tables.
+
+        Backward-compatible: pass `columns + rows` for single-table mode (old
+        callers). For multi-table workbooks pass `tables` (list of
+        `ExcelTable`) instead — every tool then sees them all and the system
+        prompt advertises each one's schema.
+        """
         run_id = uuid.uuid4().hex[:16]
         trace = AgentTrace()
 
@@ -195,20 +243,73 @@ class AgentRunner:
                 except Exception:
                     logger.exception("on_event handler raised")
 
-        stats = summarize_columns(columns, rows)
-        tool_ctx = ToolContext(columns=columns, rows=rows, stats=stats)
+        # Build the TableSlot list and the legacy columns/rows view for the
+        # AgentResult fields. If `tables` is given we use those; otherwise
+        # synthesize a single-table list from `columns + rows`.
+        if tables:
+            from kdv.excel.reader import ExcelTable as _Et  # local: avoid cycle
+
+            slots: list[Any] = []  # TableSlot, but avoid forward-ref import
+            from kdv.agent.tools import TableSlot as _Slot
+
+            for t in tables:
+                t_stats = summarize_columns(t.columns, t.rows)
+                slots.append(_Slot(
+                    table_id=t.table_id,
+                    columns=list(t.columns),
+                    rows=list(t.rows),
+                    stats=t_stats,
+                    sheet_name=t.sheet_name,
+                    source_path=t.source_path,
+                ))
+            primary = slots[0] if slots else None
+            primary_columns = primary.columns if primary else []
+            primary_rows = primary.rows if primary else []
+        else:
+            primary_columns = list(columns or [])
+            primary_rows = list(rows or [])
+            stats = summarize_columns(primary_columns, primary_rows)
+            from kdv.agent.tools import TableSlot as _Slot
+
+            slots = [_Slot(
+                table_id="default",
+                columns=primary_columns,
+                rows=primary_rows,
+                stats=stats,
+            )]
+
+        tool_ctx = ToolContext(tables=slots)
 
         ctx = ConversationContext(
             model=self.preset.model,
             output_reserve_tokens=max(2048, self.preset.max_tokens),
             keep_recent=8,
         )
-        ctx.add_system(
-            SYSTEM_PROMPT_TEMPLATE.format(
-                n_rows=len(rows),
-                column_list=", ".join(columns) or "(无)",
+        if len(slots) > 1:
+            overview_lines = []
+            for s in slots:
+                src = (s.source_path or "").split("/")[-1]
+                first_cols = ", ".join(s.columns[:6]) + (" …" if len(s.columns) > 6 else "")
+                overview_lines.append(
+                    f"- table_id=`{s.table_id}` ({len(s.rows)} 行)"
+                    + (f"  sheet={s.sheet_name}" if s.sheet_name else "")
+                    + (f"  来源={src}" if src else "")
+                    + f"\n    列：{first_cols}"
+                )
+            ctx.add_system(
+                SYSTEM_PROMPT_MULTI.format(
+                    n_tables=len(slots),
+                    table_overview="\n".join(overview_lines),
+                    default_table_id=slots[0].table_id,
+                )
             )
-        )
+        else:
+            ctx.add_system(
+                SYSTEM_PROMPT_SINGLE.format(
+                    n_rows=len(primary_rows),
+                    column_list=", ".join(primary_columns) or "(无)",
+                )
+            )
 
         loop = asyncio.get_event_loop()
         t_start = loop.time()
@@ -237,7 +338,7 @@ class AgentRunner:
             for task_idx, task in enumerate(tasks):
                 if cancel_event is not None and cancel_event.is_set():
                     return self._make_result(
-                        run_id, columns, rows, tool_ctx, task_summaries,
+                        run_id, primary_columns, primary_rows, tool_ctx, task_summaries,
                         trace, prompt_tokens, completion_tokens,
                         int((loop.time() - t_start) * 1000),
                         cancelled=True, fallbacks=fallbacks,
@@ -285,7 +386,7 @@ class AgentRunner:
                 if abort_reason and "step_limit" not in abort_reason:
                     # If aborted for hard reason (token blowup, repeated errors), stop entire run.
                     return self._make_result(
-                        run_id, columns, rows, tool_ctx, task_summaries,
+                        run_id, primary_columns, primary_rows, tool_ctx, task_summaries,
                         trace, prompt_tokens, completion_tokens,
                         int((loop.time() - t_start) * 1000),
                         cancelled=False, aborted_reason=abort_reason,
@@ -293,7 +394,7 @@ class AgentRunner:
                     )
 
         return self._make_result(
-            run_id, columns, rows, tool_ctx, task_summaries,
+            run_id, primary_columns, primary_rows, tool_ctx, task_summaries,
             trace, prompt_tokens, completion_tokens,
             int((loop.time() - t_start) * 1000),
             fallbacks=fallbacks,
