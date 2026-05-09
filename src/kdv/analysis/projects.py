@@ -66,6 +66,21 @@ class ProjectMeta:
 
 
 @dataclass
+class TableSnapshot:
+    """One sheet (or one upload-source) inside a multi-table project.
+
+    Stored alongside the legacy `columns`/`rows` fields so older code paths
+    (single-table view) keep working — but agent runs persist every loaded
+    table here for round-tripping.
+    """
+    table_id: str = ""
+    sheet_name: str = ""
+    source_path: str = ""
+    columns: list[str] = field(default_factory=list)
+    rows: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class ProjectSnapshot:
     """The fully self-contained state of one analysis project."""
 
@@ -92,14 +107,31 @@ class ProjectSnapshot:
     chart_specs: list[dict[str, Any]] = field(default_factory=list)
     insights: list[dict[str, Any]] = field(default_factory=list)
     chat_history: list[dict[str, Any]] = field(default_factory=list)
+    # Multi-table workbook snapshot. For single-table projects this is empty
+    # and `columns`/`rows` above are the source of truth (back-compat). For
+    # agent or multi-sheet runs this holds every loaded sheet.
+    tables: list[TableSnapshot] = field(default_factory=list)
 
     def to_payload_json(self) -> str:
-        return json.dumps(self.__dict__, ensure_ascii=False, default=str)
+        d = dict(self.__dict__)
+        # Serialize tables explicitly so dataclass-as-dict stays JSON-friendly.
+        d["tables"] = [t.__dict__ if isinstance(t, TableSnapshot) else t for t in self.tables]
+        return json.dumps(d, ensure_ascii=False, default=str)
 
     @classmethod
     def from_payload_json(cls, blob: str) -> "ProjectSnapshot":
         d = json.loads(blob)
-        return cls(**d)
+        # Backwards compatible: older snapshots have no `tables` field.
+        raw_tables = d.pop("tables", None) or []
+        # Drop unknown keys so future-vs-past schema mismatches don't crash.
+        valid_keys = set(cls.__dataclass_fields__.keys())
+        d = {k: v for k, v in d.items() if k in valid_keys}
+        snap = cls(**d)
+        snap.tables = [
+            TableSnapshot(**t) if isinstance(t, dict) else t
+            for t in raw_tables
+        ]
+        return snap
 
 
 class ProjectStore:

@@ -28,9 +28,9 @@ from PySide6.QtWidgets import (
 from kdv.agent.manager import parse_tasks
 from kdv.agent.runner import AgentRunner, AgentResult
 from kdv.agent.trace import TraceEvent
-from kdv.analysis.projects import ProjectSnapshot
+from kdv.analysis.projects import ProjectSnapshot, TableSnapshot
 from kdv.analysis.runner import AnalysisRunner, RunProgress, RunResult
-from kdv.excel.reader import ExcelTable, read_excel
+from kdv.excel.reader import ExcelTable, concat_tables, read_excel, read_workbook
 from kdv.excel.writer import write_results
 from kdv.ui import helpers as h
 from kdv.ui.animations import animate_int_value, reveal_height, shake
@@ -45,6 +45,11 @@ class RunPage(QWidget):
         super().__init__()
         self.state = state
         self.setObjectName("page")
+        # Workbook = list of every loaded sheet across every loaded file.
+        # _data exposes the "primary" view (first table for the preview /
+        # legacy code paths). For non-agent runs, concat_tables flattens the
+        # whole workbook. For agent runs, the full list is passed to spawn().
+        self._tables: list[ExcelTable] = []
         self._data: ExcelTable | None = None
         self._cancel_event: asyncio.Event | None = None
         self._build()
@@ -181,11 +186,33 @@ class RunPage(QWidget):
         data_head.addWidget(h.heading("输入数据", level=3))
         data_head.addStretch(1)
         self.upload_btn = h.primary_button("📂 上传数据 Excel")
+        self.upload_btn.setToolTip(
+            "支持多选——按住 Ctrl/Cmd 可一次上传多个文件，多 sheet 文件自动展开成多张表。"
+        )
         self.upload_btn.clicked.connect(self._on_upload)
+        self.clear_btn = h.ghost_button("清空")
+        self.clear_btn.clicked.connect(self._on_clear_tables)
+        self.clear_btn.setVisible(False)
+        data_head.addWidget(self.clear_btn)
         data_head.addWidget(self.upload_btn)
         data_card.layout().addLayout(data_head)
-        self.data_meta = h.muted("尚未上传数据。")
+        self.data_meta = h.muted("尚未上传数据。支持多文件 + 多 sheet。")
         data_card.layout().addWidget(self.data_meta)
+
+        # When multiple tables are loaded, this combo lets the user pick
+        # which one to preview. Hidden in the single-table case.
+        preview_row = QHBoxLayout()
+        preview_row.setContentsMargins(0, 0, 0, 0)
+        self.table_picker_label = h.muted("预览表：")
+        self.table_picker_label.setVisible(False)
+        self.table_picker = QComboBox()
+        self.table_picker.setMinimumHeight(28)
+        self.table_picker.currentIndexChanged.connect(self._on_preview_table_changed)
+        self.table_picker.setVisible(False)
+        preview_row.addWidget(self.table_picker_label)
+        preview_row.addWidget(self.table_picker, 1)
+        data_card.layout().addLayout(preview_row)
+
         self.data_preview = QTableWidget(0, 0)
         self.data_preview.verticalHeader().setVisible(False)
         self.data_preview.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -415,22 +442,94 @@ class RunPage(QWidget):
 
     # ---- data ------------------------------------------------------------
     def _on_upload(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择数据 Excel", "", "Excel 文件 (*.xlsx *.xlsm)"
+        # Multi-select; each .xlsx / .xlsm may contain multiple sheets, all
+        # loaded automatically. Re-uploading APPENDS to the existing list so
+        # the user can stage a workbook from several picks; "清空" resets it.
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择数据 Excel（可多选）", "", "Excel 文件 (*.xlsx *.xlsm)"
         )
-        if not path:
+        if not paths:
             return
         try:
-            tbl = read_excel(path)
+            new_tables = read_workbook(paths)
         except Exception as e:  # noqa: BLE001
             h.toast(self.window(), f"读取失败：{e}", "danger")
             return
-        self._data = tbl
-        self.data_meta.setText(
-            f"已加载：{Path(path).name} · sheet={tbl.sheet_name} · "
-            f"{len(tbl.rows)} 行 × {len(tbl.columns)} 列"
-        )
-        self._fill_preview(tbl)
+        if not new_tables:
+            h.toast(self.window(), "所选文件没有可用数据 sheet", "warning")
+            return
+        # Disambiguate against tables already loaded from earlier picks.
+        existing_ids = {t.table_id for t in self._tables}
+        for t in new_tables:
+            base = t.table_id
+            i = 2
+            while t.table_id in existing_ids:
+                t.table_id = f"{base}#{i}"
+                i += 1
+            existing_ids.add(t.table_id)
+        self._tables.extend(new_tables)
+        # Primary view = first table (used by legacy preview / writer code).
+        self._data = self._tables[0]
+        self._refresh_table_picker()
+        self._refresh_data_meta()
+        self._fill_preview(self._tables[0])
+        self.clear_btn.setVisible(True)
+
+    def _on_clear_tables(self) -> None:
+        self._tables = []
+        self._data = None
+        self.data_preview.setRowCount(0)
+        self.data_preview.setColumnCount(0)
+        self.data_meta.setText("尚未上传数据。支持多文件 + 多 sheet。")
+        self.table_picker.blockSignals(True)
+        self.table_picker.clear()
+        self.table_picker.blockSignals(False)
+        self.table_picker.setVisible(False)
+        self.table_picker_label.setVisible(False)
+        self.clear_btn.setVisible(False)
+
+    def _refresh_data_meta(self) -> None:
+        if not self._tables:
+            self.data_meta.setText("尚未上传数据。支持多文件 + 多 sheet。")
+            return
+        files = sorted({Path(t.source_path).name for t in self._tables if t.source_path})
+        total_rows = sum(len(t.rows) for t in self._tables)
+        if len(self._tables) == 1:
+            t = self._tables[0]
+            self.data_meta.setText(
+                f"已加载：{Path(t.source_path).name} · sheet={t.sheet_name} · "
+                f"{len(t.rows)} 行 × {len(t.columns)} 列"
+            )
+        else:
+            self.data_meta.setText(
+                f"已加载 {len(self._tables)} 张表（来自 {len(files)} 个文件，"
+                f"共 {total_rows} 行）："
+                f" {', '.join(files)}"
+                + "\n  非 Agent 模式会自动拼成一张表（加 _table_id 列标记来源）；"
+                "Agent 模式可独立访问每张表。"
+            )
+
+    def _refresh_table_picker(self) -> None:
+        self.table_picker.blockSignals(True)
+        self.table_picker.clear()
+        for t in self._tables:
+            self.table_picker.addItem(
+                f"{t.table_id}  ({len(t.rows)} 行 × {len(t.columns)} 列)",
+                t.table_id,
+            )
+        self.table_picker.blockSignals(False)
+        multi = len(self._tables) > 1
+        self.table_picker.setVisible(multi)
+        self.table_picker_label.setVisible(multi)
+
+    def _on_preview_table_changed(self) -> None:
+        tid = self.table_picker.currentData()
+        if not tid:
+            return
+        for t in self._tables:
+            if t.table_id == tid:
+                self._fill_preview(t)
+                return
 
     def _fill_preview(self, tbl: ExcelTable) -> None:
         cols = tbl.columns
@@ -466,7 +565,7 @@ class RunPage(QWidget):
             h.toast(self.window(), "请先选择 LLM 配置", "warning")
             shake(self.preset_picker)
             return
-        if not self._data or not self._data.rows:
+        if not self._tables or not any(t.rows for t in self._tables):
             h.toast(self.window(), "请上传数据 Excel", "warning")
             shake(self.upload_btn)
             return
@@ -489,7 +588,12 @@ class RunPage(QWidget):
                 )
                 shake(self.extra_goal)
                 return
-            name = f"{Path(self._data.source_path).stem} · {datetime.now().strftime('%H:%M:%S')}"
+            stem = Path(self._tables[0].source_path).stem if self._tables[0].source_path else "agent"
+            n_tabs = len(self._tables)
+            name = (
+                f"{stem}{f' +{n_tabs - 1} 表' if n_tabs > 1 else ''} · "
+                f"{datetime.now().strftime('%H:%M:%S')}"
+            )
             fast_pid = self.fast_picker.currentData() or ""
             fast_preset = self.state.presets.get(fast_pid) if fast_pid else None
             fast_api_key = self.state.get_api_key(fast_preset) if fast_preset else ""
@@ -498,15 +602,15 @@ class RunPage(QWidget):
                 tasks=tasks,
                 preset=preset,
                 api_key=api_key,
-                columns=list(self._data.columns),
-                rows=list(self._data.rows),
+                tables=list(self._tables),
                 fast_preset=fast_preset,
                 fast_api_key=fast_api_key,
             )
             fast_label = f"，快速模型 {fast_preset.name}" if fast_preset else ""
+            tables_label = f"，{n_tabs} 张表" if n_tabs > 1 else ""
             h.toast(
                 self.window(),
-                f"已启动 Agent：{name}（共 {len(tasks)} 个任务{fast_label}）",
+                f"已启动 Agent：{name}（共 {len(tasks)} 个任务{tables_label}{fast_label}）",
                 "success",
             )
             self.agent_job_requested.emit()
@@ -561,13 +665,24 @@ class RunPage(QWidget):
         except Exception:
             pass
 
-        total = len(self._data.rows)
+        # Multi-table → single virtual table for the legacy non-agent path.
+        # When only one table was loaded, concat_tables still adds the
+        # `_table_id` column (always-on so downstream code can rely on it).
+        analysis_table = concat_tables(self._tables)
+        # _data points at the merged view so downstream writer / project
+        # save logic uses it.
+        self._data = analysis_table
+        total = len(analysis_table.rows)
         self.progress.setRange(0, max(1, total))
         self.progress.setValue(0)
         self.run_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self._cancel_event = asyncio.Event()
 
+        if len(self._tables) > 1:
+            self._append_log(
+                f"已合并 {len(self._tables)} 张表 → {total} 行（加 _table_id 列）"
+            )
         self._append_log(f"开始：{total} 行，模式 {mode}，并发 {preset.max_concurrency}")
 
         runner = AnalysisRunner(
@@ -592,8 +707,8 @@ class RunPage(QWidget):
 
         try:
             result = await runner.run(
-                columns=self._data.columns,
-                rows=self._data.rows,
+                columns=analysis_table.columns,
+                rows=analysis_table.rows,
                 mode=mode,  # type: ignore[arg-type]
                 on_progress=on_progress,
                 cancel_event=self._cancel_event,
@@ -635,6 +750,19 @@ class RunPage(QWidget):
                 prompt_tokens_total=result.prompt_tokens_total,
                 completion_tokens_total=result.completion_tokens_total,
                 duration_ms_total=result.duration_ms_total,
+                # Persist every loaded sheet so reopening the project shows
+                # the full workbook (multi-sheet info would otherwise be lost
+                # after concat_tables flattens it into the result `rows`).
+                tables=[
+                    TableSnapshot(
+                        table_id=t.table_id,
+                        sheet_name=t.sheet_name,
+                        source_path=t.source_path,
+                        columns=list(t.columns),
+                        rows=list(t.rows),
+                    )
+                    for t in (self._tables or [])
+                ],
             )
             self.state.projects.save(snap)
             self._append_log(f"已保存为项目：{project_name}")

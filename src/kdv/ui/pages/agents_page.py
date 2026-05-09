@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 
 from kdv.agent.manager import AgentJob, parse_tasks
 from kdv.agent.trace import TraceEvent
-from kdv.excel.reader import ExcelTable, read_excel
+from kdv.excel.reader import ExcelTable, read_excel, read_workbook
 from kdv.ui import helpers as h
 from kdv.ui import style
 from kdv.ui.state import AppState
@@ -335,6 +335,7 @@ class NewAgentJobDialog(QDialog):
         super().__init__(parent)
         self.state = state
         self._data: ExcelTable | None = None
+        self._tables: list[ExcelTable] = []
         self.setWindowTitle("新建 Agent 任务")
         self.setMinimumSize(640, 540)
         self._build()
@@ -474,20 +475,43 @@ class NewAgentJobDialog(QDialog):
             self._fc_warning.setVisible(False)
 
     def _on_upload(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择数据 Excel", "", "Excel 文件 (*.xlsx *.xlsm)"
+        # Multi-select; multi-sheet auto-expanded; re-clicking appends.
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择数据 Excel（可多选）", "", "Excel 文件 (*.xlsx *.xlsm)"
         )
-        if not path:
+        if not paths:
             return
         try:
-            tbl = read_excel(path)
+            new_tables = read_workbook(paths)
         except Exception as e:  # noqa: BLE001
             h.toast(self, f"读取失败：{e}", "danger")
             return
-        self._data = tbl
-        self.data_label.setText(
-            f"{Path(path).name} · {len(tbl.rows)} 行 × {len(tbl.columns)} 列"
-        )
+        if not new_tables:
+            h.toast(self, "所选文件没有可用数据 sheet", "warning")
+            return
+        existing_ids = {t.table_id for t in self._tables}
+        for t in new_tables:
+            base = t.table_id
+            i = 2
+            while t.table_id in existing_ids:
+                t.table_id = f"{base}#{i}"
+                i += 1
+            existing_ids.add(t.table_id)
+        self._tables.extend(new_tables)
+        self._data = self._tables[0]
+        files = sorted({Path(t.source_path).name for t in self._tables if t.source_path})
+        total_rows = sum(len(t.rows) for t in self._tables)
+        if len(self._tables) == 1:
+            t = self._tables[0]
+            self.data_label.setText(
+                f"{Path(t.source_path).name} · sheet={t.sheet_name} · "
+                f"{len(t.rows)} 行 × {len(t.columns)} 列"
+            )
+        else:
+            self.data_label.setText(
+                f"{len(self._tables)} 张表（{len(files)} 个文件，共 {total_rows} 行）"
+                f"  · {', '.join(files)}"
+            )
 
     def payload(self) -> dict | None:
         pid = self.preset_picker.currentData()
@@ -501,15 +525,16 @@ class NewAgentJobDialog(QDialog):
         if not api_key:
             h.toast(self.parent() or self, "选中预设的 API key 为空", "danger")
             return None
-        if not self._data or not self._data.rows:
+        if not self._tables or not any(t.rows for t in self._tables):
             h.toast(self.parent() or self, "请上传数据 Excel", "warning")
             return None
         tasks = parse_tasks(self.tasks_input.toPlainText())
         if not tasks:
             h.toast(self.parent() or self, "请至少写一个任务", "warning")
             return None
+        stem = Path(self._tables[0].source_path).stem if self._tables[0].source_path else "agent"
         name = self.name_input.text().strip() or (
-            f"{Path(self._data.source_path).stem} · "
+            f"{stem}{f' +{len(self._tables) - 1} 表' if len(self._tables) > 1 else ''} · "
             f"{datetime.now().strftime('%H:%M:%S')}"
         )
         # Optional fast preset for the tool-call loop
@@ -521,8 +546,7 @@ class NewAgentJobDialog(QDialog):
             "tasks": tasks,
             "preset": preset,
             "api_key": api_key,
-            "columns": list(self._data.columns),
-            "rows": list(self._data.rows),
+            "tables": list(self._tables),
             "fast_preset": fast_preset,
             "fast_api_key": fast_api_key,
         }

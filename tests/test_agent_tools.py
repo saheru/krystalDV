@@ -4,7 +4,8 @@ from __future__ import annotations
 import pytest
 
 from kdv.agent.context import ConversationContext
-from kdv.agent.tools import ToolContext, build_default_registry
+from kdv.agent.tools import TableSlot, ToolContext, build_default_registry
+from kdv.excel.reader import ExcelTable, concat_tables
 from kdv.viz.column_stats import summarize_columns
 
 
@@ -197,3 +198,114 @@ async def test_compact_async_returns_zero_on_empty_summary():
     n = await ctx.compact_async(empty_summarizer)
     assert n == 0
     assert ctx.messages == msgs_before
+
+
+# ----------------------------------------------------------------------
+# Multi-table workbook support
+# ----------------------------------------------------------------------
+def _make_two_table_ctx() -> ToolContext:
+    """Two tables on the same key — used for cross-table tool tests."""
+    a = TableSlot(
+        table_id="invoices.xlsx/Sheet1",
+        columns=["渠道", "金额"],
+        rows=[
+            {"渠道": "美团", "金额": 19144},
+            {"渠道": "饿了么", "金额": 11446},
+            {"渠道": "抖音外卖", "金额": 8894},
+        ],
+        stats=summarize_columns(["渠道", "金额"], []),
+    )
+    b = TableSlot(
+        table_id="ledger.xlsx/Sheet1",
+        columns=["渠道", "金额"],
+        rows=[
+            {"渠道": "美团", "金额": 19200},   # +56
+            {"渠道": "饿了么", "金额": 11000},  # -446
+            {"渠道": "顺丰同城", "金额": 6436},  # only in B
+        ],
+        stats=summarize_columns(["渠道", "金额"], []),
+    )
+    return ToolContext(tables=[a, b])
+
+
+def test_legacy_single_table_constructor_still_works():
+    cols = ["x", "y"]
+    rows = [{"x": 1, "y": 2}, {"x": 3, "y": 4}]
+    ctx = ToolContext(columns=cols, rows=rows, stats=summarize_columns(cols, rows))
+    # Legacy field aliases still work...
+    assert ctx.columns == cols and ctx.rows == rows
+    # ...and a TableSlot was synthesised so multi-table tools also work.
+    assert len(ctx.tables) == 1
+    assert ctx.tables[0].columns == cols
+
+
+def test_list_tables_lists_all_loaded_tables():
+    ctx = _make_two_table_ctx()
+    reg = build_default_registry()
+    out = reg.get("list_tables").handler(ctx, {})
+    assert "invoices.xlsx/Sheet1" in out
+    assert "ledger.xlsx/Sheet1" in out
+    # Multi-table reminder must be present so the LLM knows to pass `table=`.
+    assert "table=" in out
+
+
+def test_aggregate_picks_table_via_table_arg():
+    """Aggregating against table B with a `table` arg returns B's numbers,
+    not A's — proves the dispatch is wired through every tool, not just the
+    new cross-table ones."""
+    ctx = _make_two_table_ctx()
+    reg = build_default_registry()
+    out = reg.get("aggregate").handler(
+        ctx, {"table": "ledger.xlsx/Sheet1", "column": "金额", "op": "sum"},
+    )
+    # B sum = 19200 + 11000 + 6436 = 36636
+    assert "36636" in out
+    # And the response cites the right table id.
+    assert "ledger.xlsx/Sheet1" in out
+
+
+def test_cross_reconcile_diff_per_group():
+    ctx = _make_two_table_ctx()
+    reg = build_default_registry()
+    out = reg.get("cross_reconcile").handler(
+        ctx,
+        {
+            "table_a": "invoices.xlsx/Sheet1",
+            "table_b": "ledger.xlsx/Sheet1",
+            "group_column": "渠道",
+            "value_column": "金额",
+        },
+    )
+    # 美团: 19144-19200 = -56, 饿了么: 11446-11000=+446, 抖音外卖: only in A,
+    # 顺丰同城: only in B → B-side row should also surface.
+    assert "美团" in out and "顺丰同城" in out
+    assert "-56" in out or "-56.00" in out
+
+
+def test_join_tables_inner_join_sample():
+    ctx = _make_two_table_ctx()
+    reg = build_default_registry()
+    out = reg.get("join_tables").handler(
+        ctx,
+        {
+            "table_a": "invoices.xlsx/Sheet1",
+            "table_b": "ledger.xlsx/Sheet1",
+            "key": "渠道",
+        },
+    )
+    # 美团 + 饿了么 are in both → expect 2 matched rows.
+    assert "2 行匹配" in out
+
+
+def test_concat_tables_adds_table_id_column():
+    a = ExcelTable(columns=["x", "y"], rows=[{"x": 1, "y": 2}],
+                   sheet_name="s1", source_path="a.xlsx", table_id="a/s1")
+    b = ExcelTable(columns=["x", "z"], rows=[{"x": 9, "z": 8}],
+                   sheet_name="s1", source_path="b.xlsx", table_id="b/s1")
+    merged = concat_tables([a, b])
+    assert "_table_id" in merged.columns
+    assert {r["_table_id"] for r in merged.rows} == {"a/s1", "b/s1"}
+    # Union of columns; missing values become None.
+    assert {"x", "y", "z"} <= set(merged.columns)
+    assert merged.rows[0]["z"] is None  # row from a has no z
+    assert merged.rows[1]["y"] is None  # row from b has no y
