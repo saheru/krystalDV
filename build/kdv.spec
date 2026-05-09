@@ -32,6 +32,24 @@ SRC = PROJECT_ROOT / "src"
 ASSETS = PROJECT_ROOT / "assets"
 ENTRY = PROJECT_ROOT / "main.py"
 
+# --- version (derived from src/kdv/__init__.py without importing) -------
+# Apple's CFBundleShortVersionString expects 1-3 dot-separated numbers, so
+# we use the SemVer base only — the full PEP-440 string (with date+sha) is
+# what users see in the about dialog at runtime.
+def _read_base_version() -> str:
+    init_py = SRC / "kdv" / "__init__.py"
+    try:
+        text = init_py.read_text(encoding="utf-8")
+    except OSError:
+        return "0.0.0"
+    import re
+
+    m = re.search(r'^_BASE_VERSION\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    return m.group(1) if m else "0.0.0"
+
+
+BASE_VERSION = _read_base_version()
+
 block_cipher = None
 
 # --- data files (bundled assets) ----------------------------------------
@@ -78,6 +96,7 @@ hiddenimports += [
     "qasync",
     "darkdetect",
     "certifi",
+    "kdv._buildinfo",  # CI writes this before build; missing is OK at runtime
     "keyring.backends.Windows",
     "keyring.backends.macOS",
     "keyring.backends.SecretService",
@@ -186,8 +205,8 @@ if IS_MAC:
         info_plist={
             "CFBundleName": "Krystal Data Vision",
             "CFBundleDisplayName": "Krystal Data Vision",
-            "CFBundleShortVersionString": "0.1.0",
-            "CFBundleVersion": "0.1.0",
+            "CFBundleShortVersionString": BASE_VERSION,
+            "CFBundleVersion": BASE_VERSION,
             "NSHighResolutionCapable": True,
             # Don't show in Dock as a separate "python" — this is a real app.
             "LSApplicationCategoryType": "public.app-category.productivity",

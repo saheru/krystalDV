@@ -150,6 +150,31 @@ class RunPage(QWidget):
         pickers.addWidget(model_card, 1)
         root.addLayout(pickers)
 
+        # ---- fast model card (agent-only) ------------------------------
+        # Tool-call decision turns + context compaction can run on a cheaper
+        # model; only the final task summary needs the main model. Hidden
+        # unless the user picks Agent mode.
+        self.fast_card = h.make_card()
+        fh = QHBoxLayout()
+        fh.setContentsMargins(0, 0, 0, 0)
+        fh.addWidget(h.heading("快速模型（Agent 工具循环）", level=3))
+        fh.addStretch(1)
+        fh.addWidget(h.badge("可选", "info"))
+        self.fast_card.layout().addLayout(fh)
+        self.fast_picker = QComboBox()
+        self.fast_picker.setMinimumHeight(36)
+        self.fast_picker.addItem("（与主模型相同）", "")
+        self.fast_picker.currentIndexChanged.connect(self._on_fast_changed)
+        self.fast_card.layout().addWidget(self.fast_picker)
+        fast_hint = h.muted(
+            "💡 Agent 模式：工具调用 + 上下文压缩走快速模型（Haiku / DeepSeek / Flash），"
+            "最终任务总结仍走主模型。可显著提速 5-10×。"
+        )
+        fast_hint.setWordWrap(True)
+        self.fast_card.layout().addWidget(fast_hint)
+        self.fast_card.setVisible(False)
+        root.addWidget(self.fast_card)
+
         # ---- data card --------------------------------------------------
         data_card = h.make_card()
         data_head = QHBoxLayout()
@@ -295,6 +320,10 @@ class RunPage(QWidget):
                 "可选：本次运行的临时分析目标（覆盖模型默认目标）。"
                 "无模型快速分析时这里必填——会作为 LLM 的核心问题。"
             )
+        # Fast-model card only relevant in Agent mode (the only path that
+        # uses a separate fast preset for tool loops + compaction).
+        if hasattr(self, "fast_card"):
+            self.fast_card.setVisible(mode == "agent")
 
     def _selected_mode(self) -> str:
         for k, b in self._mode_buttons.items():
@@ -308,10 +337,16 @@ class RunPage(QWidget):
         cur_m = self.state.selected_model()
         self.preset_picker.blockSignals(True)
         self.model_picker.blockSignals(True)
+        self.fast_picker.blockSignals(True)
         self.preset_picker.clear()
         self.model_picker.clear()
+        # Preserve current fast pick if any, then rebuild from scratch.
+        prev_fast = self.fast_picker.currentData() or self.state.settings.settings.fast_preset_id
+        self.fast_picker.clear()
+        self.fast_picker.addItem("（与主模型相同）", "")
         for p in self.state.presets.list():
             self.preset_picker.addItem(f"{p.name} · {p.model}", p.id)
+            self.fast_picker.addItem(f"{p.name} · {p.model}", p.id)
         # First slot in model picker = "无模型" (ad-hoc summary-only).
         self.model_picker.addItem("（无模型 · 直接整表汇总分析）", "")
         for m in self.state.models.list():
@@ -324,9 +359,22 @@ class RunPage(QWidget):
             i = self.model_picker.findData(cur_m.id)
             if i >= 0:
                 self.model_picker.setCurrentIndex(i)
+        if prev_fast:
+            i = self.fast_picker.findData(prev_fast)
+            if i >= 0:
+                self.fast_picker.setCurrentIndex(i)
         self.preset_picker.blockSignals(False)
         self.model_picker.blockSignals(False)
+        self.fast_picker.blockSignals(False)
         self._on_pickers_changed()
+
+    def _on_fast_changed(self) -> None:
+        fid = self.fast_picker.currentData() or ""
+        try:
+            self.state.settings.update(fast_preset_id=fid)
+        except Exception:
+            # Persisting prefs is best-effort; never break the run flow.
+            pass
 
     def _on_pickers_changed(self) -> None:
         pid = self.preset_picker.currentData()
@@ -442,6 +490,9 @@ class RunPage(QWidget):
                 shake(self.extra_goal)
                 return
             name = f"{Path(self._data.source_path).stem} · {datetime.now().strftime('%H:%M:%S')}"
+            fast_pid = self.fast_picker.currentData() or ""
+            fast_preset = self.state.presets.get(fast_pid) if fast_pid else None
+            fast_api_key = self.state.get_api_key(fast_preset) if fast_preset else ""
             self.state.agents.spawn(
                 name=name,
                 tasks=tasks,
@@ -449,10 +500,13 @@ class RunPage(QWidget):
                 api_key=api_key,
                 columns=list(self._data.columns),
                 rows=list(self._data.rows),
+                fast_preset=fast_preset,
+                fast_api_key=fast_api_key,
             )
+            fast_label = f"，快速模型 {fast_preset.name}" if fast_preset else ""
             h.toast(
                 self.window(),
-                f"已启动 Agent：{name}（共 {len(tasks)} 个任务）",
+                f"已启动 Agent：{name}（共 {len(tasks)} 个任务{fast_label}）",
                 "success",
             )
             self.agent_job_requested.emit()

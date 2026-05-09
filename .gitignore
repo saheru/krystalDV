@@ -36,6 +36,11 @@ Thumbs.db
 assets/icons/kdv.ico
 assets/icons/kdv.icns
 
+# Stamped by CI before pyinstaller runs (see .github/workflows/build-*.yml);
+# embeds date + git short-sha + commit count into __version__ so every
+# artifact is uniquely identifiable.
+src/kdv/_buildinfo.py
+
 # Tests
 .coverage
 htmlcov/
