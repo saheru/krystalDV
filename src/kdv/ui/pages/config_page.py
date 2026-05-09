@@ -45,6 +45,7 @@ class ConfigPage(QWidget):
         super().__init__()
         self.state = state
         self._current: LLMPreset | None = None
+        self._form_built: bool = False
         self.setObjectName("page")
         self._build()
         self._reload_list()
@@ -113,6 +114,7 @@ class ConfigPage(QWidget):
                 lay = it.layout()
                 if lay is not None:
                     self._delete_layout(lay)
+        self._form_built = True
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignRight)
@@ -319,6 +321,9 @@ class ConfigPage(QWidget):
                 lay = it.layout()
                 if lay is not None:
                     self._delete_layout(lay)
+        # Form widgets we cached as attrs are now dangling; force a rebuild
+        # next time _ensure_form_for is called.
+        self._form_built = False
         es = h.empty_state(
             "还没有 LLM 配置",
             "新建一个 OpenAI 兼容的服务配置，例如 DeepSeek、智谱 GLM、Moonshot 或 OpenAI 本身。",
@@ -330,26 +335,50 @@ class ConfigPage(QWidget):
 
     # ---- list -------------------------------------------------------------
     def _reload_list(self) -> None:
-        self.list.clear()
-        items = self.state.presets.list()
-        if not items:
-            self._current = None
-            self._show_empty()
-            return
-        target_id = self.state.settings.settings.last_preset_id or items[0].id
-        for p in items:
-            it = QListWidgetItem()
-            it.setSizeHint(self._list_item_size())
-            it.setData(Qt.UserRole, p.id)
-            self.list.addItem(it)
-            w = self._render_list_item(p, selected=p.id == target_id)
-            self.list.setItemWidget(it, w)
-
-        for i in range(self.list.count()):
-            if self.list.item(i).data(Qt.UserRole) == target_id:
-                self.list.setCurrentRow(i)
+        # Critical: block list signals around clear() / setCurrentRow() so
+        # itemSelectionChanged doesn't fire and recursively re-enter
+        # _on_select while we're rebuilding. Without this, _on_save → reload
+        # → setCurrentRow → _on_select → setItemWidget(s) → another
+        # itemSelectionChanged could clobber `_current` mid-test, which is
+        # how clicking 测试连接 on one preset visibly jumped back to a
+        # different (previously-selected) one.
+        self.list.blockSignals(True)
+        try:
+            self.list.clear()
+            items = self.state.presets.list()
+            if not items:
+                self._current = None
+                self._show_empty()
                 return
-        self.list.setCurrentRow(0)
+            # Prefer the current detail panel's preset over whatever is
+            # persisted in settings — otherwise side effects from other
+            # pages (run_page.refresh_pickers writes last_preset_id too)
+            # can yank focus to a different preset behind the user's back.
+            target_id = (
+                (self._current.id if self._current else None)
+                or self.state.settings.settings.last_preset_id
+                or items[0].id
+            )
+            target_idx = 0
+            for i, p in enumerate(items):
+                it = QListWidgetItem()
+                it.setSizeHint(self._list_item_size())
+                it.setData(Qt.UserRole, p.id)
+                self.list.addItem(it)
+                w = self._render_list_item(p, selected=p.id == target_id)
+                self.list.setItemWidget(it, w)
+                if p.id == target_id:
+                    target_idx = i
+            self.list.setCurrentRow(target_idx)
+        finally:
+            self.list.blockSignals(False)
+        # Sync the form to the new selection without going through the
+        # `itemSelectionChanged` path. _ensure_form_for() builds the form
+        # only when needed and populates from the target preset.
+        target = self.state.presets.get(target_id) if items else None
+        if target is not None:
+            self._current = target
+            self._ensure_form_for(target)
 
     def _list_item_size(self):
         from PySide6.QtCore import QSize
@@ -411,12 +440,17 @@ class ConfigPage(QWidget):
         return card
 
     def _on_select(self) -> None:
+        # Fired only by genuine user-driven selection changes — _reload_list
+        # blocks the signal during programmatic rebuilds.
         item = self.list.currentItem()
         if not item:
             return
         pid = item.data(Qt.UserRole)
         p = self.state.presets.get(pid)
         if not p:
+            return
+        if self._current is not None and self._current.id == pid:
+            # Already on this preset — no need to re-render anything.
             return
         self._current = p
         self.state.settings.update(last_preset_id=pid)
@@ -429,7 +463,20 @@ class ConfigPage(QWidget):
                 self.list.setItemWidget(
                     li, self._render_list_item(other, selected=other_id == pid)
                 )
-        self._build_form()
+        self._ensure_form_for(p)
+
+    def _ensure_form_for(self, p: LLMPreset) -> None:
+        """Build the form on first use, then just populate values.
+
+        The previous version tore down + rebuilt every form widget on every
+        selection change, which interacted badly with `_on_test`'s in-flight
+        await — old widget refs would deleteLater() during the test, and
+        signal recursion through _reload_list could end up overwriting the
+        selection. Building once and only populating on switch removes that
+        whole class of races.
+        """
+        if not self._form_built:
+            self._build_form()
         self._populate_form(p)
 
     def _populate_form(self, p: LLMPreset) -> None:
